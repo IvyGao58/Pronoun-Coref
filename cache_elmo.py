@@ -16,10 +16,10 @@ def build_elmo():
   lm_embeddings = elmo_module(
       inputs={"tokens": token_ph, "sequence_len": len_ph},
       signature="tokens", as_dict=True)
-  word_emb = lm_embeddings["word_emb"]
+  word_emb = lm_embeddings["word_emb"]  # [?, ?, 512]
   lm_emb = tf.stack([tf.concat([word_emb, word_emb], -1),
                      lm_embeddings["lstm_outputs1"],
-                     lm_embeddings["lstm_outputs2"]], -1)
+                     lm_embeddings["lstm_outputs2"]], -1)  # [?, ?, 1024, 3]
   return token_ph, len_ph, lm_emb
 
 def cache_dataset(data_path, session, token_ph, len_ph, lm_emb, out_file):

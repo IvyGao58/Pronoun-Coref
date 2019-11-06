@@ -22,7 +22,6 @@ if __name__ == "__main__":
 
     log_dir = config["log_dir"]
 
-
     max_f1 = 0
 
     with tf.Session() as session:

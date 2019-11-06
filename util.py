@@ -206,6 +206,8 @@ class EmbeddingDictionary(object):
                     word_end = line.find(" ")
                     word = line[:word_end]
                     embedding = np.fromstring(line[word_end + 1:], np.float32, sep=" ")
+                    if len(embedding) == 1:  # first row
+                        continue
                     assert len(embedding) == self.size
                     embedding_dict[word] = embedding
             if vocab_size is not None:
