@@ -10,6 +10,18 @@ import json
 import sys
 
 
+def buil_bert(input_ids, input_mask, segment_ids):
+    bert_module = hub.Module("https://tfhub.dev/google/bert_chinese_L-12_H-768_A-12/1", trainable=True)
+    bert_inputs = dict(input_ids=input_ids, input_mask=input_mask, segment_ids=segment_ids)
+    bert_outputs = bert_module(bert_inputs, signature="tokens", as_dict=True)
+    pooled_output = bert_outputs["pooled_output"]  # [batch_size, hidden_size]
+    sequence_output = bert_outputs["sequence_output"]  # [batch_size, max_sequence_length, hidden_size]
+    return sequence_output, pooled_output
+
+
+"""This elmo model is pretrained by pytorch, we use tranditional chinese pretrained model. """
+
+
 def build_elmo():
     token_ph = tf.placeholder(tf.string, [None, None])
     len_ph = tf.placeholder(tf.int32, [None])
@@ -17,10 +29,10 @@ def build_elmo():
     lm_embeddings = elmo_module(
         inputs={"tokens": token_ph, "sequence_len": len_ph},
         signature="tokens", as_dict=True)
-    word_emb = lm_embeddings["word_emb"]  # [?, ?, 512]
+    word_emb = lm_embeddings["word_emb"]
     lm_emb = tf.stack([tf.concat([word_emb, word_emb], -1),
                        lm_embeddings["lstm_outputs1"],
-                       lm_embeddings["lstm_outputs2"]], -1)  # [?, ?, 1024, 3]
+                       lm_embeddings["lstm_outputs2"]], -1)
     return token_ph, len_ph, lm_emb
 
 
@@ -35,7 +47,7 @@ def cache_dataset(data_path, session, token_ph, len_ph, lm_emb, out_file):
             for i, sentence in enumerate(sentences):
                 for j, word in enumerate(sentence):
                     tokens[i][j] = word
-            tokens = np.array(tokens)  # [21, 37], max_len=37 being padded with ''
+            tokens = np.array(tokens)
             tf_lm_emb = session.run(lm_emb, feed_dict={
                 token_ph: tokens,
                 len_ph: text_len
@@ -44,7 +56,7 @@ def cache_dataset(data_path, session, token_ph, len_ph, lm_emb, out_file):
             group = out_file.create_group(file_key)
             for i, (e, l) in enumerate(zip(tf_lm_emb, text_len)):
                 e = e[:l, :, :]
-                group[str(i)] = e  # i 代表text中的每句sentence
+                group[str(i)] = e
             if doc_num % 10 == 0:
                 print("Cached {} documents in {}".format(doc_num + 1, data_path))
 

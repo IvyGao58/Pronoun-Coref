@@ -26,6 +26,7 @@ if __name__ == "__main__":
 
     with tf.Session() as session:
         writer = tf.summary.FileWriter(log_dir, session.graph, flush_secs=20)
+        print('begin to initialize global variables...')
         session.run(tf.global_variables_initializer())
         model.start_enqueue_thread(session)
         accumulated_loss = 0.0
@@ -36,6 +37,7 @@ if __name__ == "__main__":
             saver.restore(session, ckpt.model_checkpoint_path)
 
         initial_time = time.time()
+        print('begin to run the model...')
         while True:
             tf_loss, tf_global_step, _ = session.run([model.loss, model.global_step, model.train_op])
             accumulated_loss += tf_loss

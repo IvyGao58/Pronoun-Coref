@@ -321,12 +321,6 @@ possessive_pronoun = ['his', 'hers', 'its', 'their', 'theirs', 'His', 'Hers', 'I
 all_pronouns_by_type = dict()
 all_pronouns_by_type['first_and_second_personal'] = first_and_second_personal_pronouns
 all_pronouns_by_type['third_personal'] = third_personal_pronouns
-all_pronouns_by_type['neutral'] = neutral_pronoun
-all_pronouns_by_type['relative'] = relative_pronouns
-all_pronouns_by_type['demonstrative'] = demonstrative_pronouns
-all_pronouns_by_type['indefinite'] = indefinite_pronouns
-all_pronouns_by_type['reflexive'] = reflexive_pronouns
-all_pronouns_by_type['interrogative'] = interrogative_pronouns
 all_pronouns_by_type['possessive'] = possessive_pronoun
 
 all_pronouns = list()

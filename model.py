@@ -4,7 +4,6 @@ from __future__ import print_function
 
 import random
 import threading
-import tensorflow_hub as hub
 import h5py
 
 import util
@@ -26,8 +25,8 @@ class KnowledgePronounCorefModel(object):
             self.lm_file = h5py.File(self.config["lm_path"], "r")
         else:
             self.lm_file = None
-        self.lm_layers = self.config["lm_layers"]
-        self.lm_size = self.config["lm_size"]
+        self.lm_layers = self.config["lm_layers"]  # 3
+        self.lm_size = self.config["lm_size"]  # 1024
         self.eval_data = None  # Load eval data lazily.
         print('Start to load the eval data')
         st = time.time()
@@ -42,7 +41,6 @@ class KnowledgePronounCorefModel(object):
         input_props.append((tf.int32, [None, None, None]))  # Character indices.
         input_props.append((tf.int32, [None]))  # Text lengths.
         input_props.append((tf.int32, [None]))  # Speaker IDs.
-        input_props.append((tf.int32, []))  # Genre.
         input_props.append((tf.bool, []))  # Is training.
         input_props.append((tf.int32, [None]))  # gold_starts.
         input_props.append((tf.int32, [None]))  # gold_ends.
@@ -105,10 +103,11 @@ class KnowledgePronounCorefModel(object):
     def load_lm_embeddings(self, doc_key):
         if self.lm_file is None:
             return np.zeros([0, 0, self.lm_size, self.lm_layers])
-        # file_key = doc_key.replace("/", ":")
         group = self.lm_file[doc_key]
-        num_sentences = len(list(group.keys()))
+        num_sentences = len(list(group.keys()))  # number of sentence
         sentences = [group[str(i)][...] for i in range(num_sentences)]
+
+        # 句子个数 * 最大句长
         lm_emb = np.zeros([num_sentences, max(s.shape[0] for s in sentences), self.lm_size, self.lm_layers])
         for i, s in enumerate(sentences):
             lm_emb[i, :s.shape[0], :, :] = s
@@ -145,7 +144,6 @@ class KnowledgePronounCorefModel(object):
         speakers = util.flatten(example["speakers"])
 
         assert num_words == len(speakers)
-
         max_sentence_length = max(len(s) for s in sentences)
         max_word_length = max(max(max(len(w) for w in s) for s in sentences), max(self.config["filter_widths"]))
         text_len = np.array([len(s) for s in sentences])
@@ -164,7 +162,7 @@ class KnowledgePronounCorefModel(object):
         speaker_dict = {s: i for i, s in enumerate(set(speakers))}
         speaker_ids = np.array([speaker_dict[s] for s in speakers])
 
-        doc_key = example["doc_key"]
+        doc_key = example["doc_key"].strip()
 
         lm_emb = self.load_lm_embeddings(doc_key)
 
@@ -224,87 +222,104 @@ class KnowledgePronounCorefModel(object):
                                  number_features, candidate_positions, pronoun_positions, labels, candidate_mask):
         all_k = util.shape(number_features, 0)
         all_c = util.shape(number_features, 1)
+
+        #  dropout
         self.dropout = self.get_dropout(self.config["dropout_rate"], is_training)
         self.lexical_dropout = self.get_dropout(self.config["lexical_dropout_rate"], is_training)
         self.lstm_dropout = self.get_dropout(self.config["lstm_dropout_rate"], is_training)
 
-        num_sentences = tf.shape(context_word_emb)[0]
-        max_sentence_length = tf.shape(context_word_emb)[1]
+        num_sentences = tf.shape(context_word_emb)[0]  # 当前example的sentence个数
+        max_sentence_length = tf.shape(context_word_emb)[1]  # sentences中最长的句子长度
 
         context_emb_list = [context_word_emb]
         head_emb_list = [head_word_emb]
 
         if self.config["char_embedding_size"] > 0:
-
-            # [num_sentences, max_sentence_length, max_word_length, emb]
+            # [num_sentences, max_sentence_length, max_word_length, emb]  [?, ?, ?, 8]
             char_emb = tf.gather(tf.get_variable("char_embeddings", [len(self.char_dict),
                                                                      self.config["char_embedding_size"]]), char_index)
 
-            # [num_sentences * max_sentence_length, max_word_length, emb]
+            # [num_sentences * max_sentence_length, max_word_length, emb] [?, ?, 8]
             flattened_char_emb = tf.reshape(char_emb, [num_sentences * max_sentence_length, util.shape(char_emb, 2),
                                                        util.shape(char_emb, 3)])
 
-            # [num_sentences * max_sentence_length, emb]
+            # [num_sentences * max_sentence_length, emb] [?, 150]
             flattened_aggregated_char_emb = util.cnn(flattened_char_emb, self.config["filter_widths"], self.config[
                 "filter_size"])
 
-            # [num_sentences, max_sentence_length, emb]
+            # [num_sentences, max_sentence_length, emb] [?, ?, 150]
             aggregated_char_emb = tf.reshape(flattened_aggregated_char_emb, [num_sentences, max_sentence_length,
                                                                              util.shape(flattened_aggregated_char_emb,
                                                                                         1)])
             context_emb_list.append(aggregated_char_emb)
             head_emb_list.append(aggregated_char_emb)
 
-        if not self.lm_file:
-            elmo_module = hub.Module("https://tfhub.dev/google/elmo/2")
-            lm_embeddings = elmo_module(
-                inputs={"tokens": tokens, "sequence_len": text_len},
-                signature="tokens", as_dict=True)
-
-            # [num_sentences, max_sentence_length, 512]
-            word_emb = lm_embeddings["word_emb"]
-
-            # [num_sentences, max_sentence_length, 1024, 3]
-            lm_emb = tf.stack([tf.concat([word_emb, word_emb], -1), lm_embeddings["lstm_outputs1"], lm_embeddings["lstm_outputs2"]], -1)
-
-        lm_emb_size = util.shape(lm_emb, 2)
-        lm_num_layers = util.shape(lm_emb, 3)
+        lm_emb_size = util.shape(lm_emb, 2)  # 1024
+        lm_num_layers = util.shape(lm_emb, 3)  # 3
         with tf.variable_scope("lm_aggregation"):
             self.lm_weights = tf.nn.softmax(
                 tf.get_variable("lm_scores", [lm_num_layers], initializer=tf.constant_initializer(0.0)))
             self.lm_scaling = tf.get_variable("lm_scaling", [], initializer=tf.constant_initializer(1.0))
+
+        # reshape lm_emb [?, 3]
         flattened_lm_emb = tf.reshape(lm_emb, [num_sentences * max_sentence_length * lm_emb_size, lm_num_layers])
 
-        # [num_sentences * max_sentence_length * emb, 1]
-        flattened_aggregated_lm_emb = tf.matmul(flattened_lm_emb, tf.expand_dims(self.lm_weights, 1))
+        # lm_emb matmul weight matrix [num_sentences * max_sentence_length * emb, 1]
+        flattened_aggregated_lm_emb = tf.matmul(flattened_lm_emb, tf.expand_dims(self.lm_weights, 1))  # [?, 1]
 
+        # lm_emb reshape [?, ?, 1024]
         aggregated_lm_emb = tf.reshape(flattened_aggregated_lm_emb, [num_sentences, max_sentence_length, lm_emb_size])
         aggregated_lm_emb *= self.lm_scaling
+
+        # add elmo emb to context_emb_list
         if self.config['use_elmo']:
             context_emb_list.append(aggregated_lm_emb)
 
-        context_emb = tf.concat(context_emb_list, 2)  # [num_sentences, max_sentence_length, emb]
-        head_emb = tf.concat(head_emb_list, 2)  # [num_sentences, max_sentence_length, emb]
-        context_emb = tf.nn.dropout(context_emb, self.lexical_dropout)  # [num_sentences, max_sentence_length, emb]
-        head_emb = tf.nn.dropout(head_emb, self.lexical_dropout)  # [num_sentences, max_sentence_length, emb]
+        # add context_emb to context_emb_list [num_sentences, max_sentence_length, emb] [?, ?, 1474] cat多个embedding表示
+        context_emb = tf.concat(context_emb_list, 2)
 
-        text_len_mask = tf.sequence_mask(text_len, maxlen=max_sentence_length)  # [num_sentence, max_sentence_length]
+        # add head emb to head_emb_list [num_sentences, max_sentence_length, emb] [?, ?, 450]  cat多个head embedding表示
+        head_emb = tf.concat(head_emb_list, 2)
 
-        context_outputs = self.lstm_contextualize(context_emb, text_len, text_len_mask)  # [num_words, emb]
+        # [num_sentences, max_sentence_length, emb] [?, ?, 1474]
+        context_emb = tf.nn.dropout(context_emb, self.lexical_dropout)
+
+        # [num_sentences, max_sentence_length, emb] [?, ?, 450]
+        head_emb = tf.nn.dropout(head_emb, self.lexical_dropout)
+
+        # [num_sentence, max_sentence_length]
+        text_len_mask = tf.sequence_mask(text_len, maxlen=max_sentence_length)
+
+        # context to lstm [num_words, emb] [?, 400]
+        context_outputs = self.lstm_contextualize(context_emb, text_len, text_len_mask)
         num_words = util.shape(context_outputs, 0)
 
-        flattened_head_emb = self.flatten_emb_by_sentence(head_emb, text_len_mask)  # [num_words]
+        # [num_words] [?, 450]
+        flattened_head_emb = self.flatten_emb_by_sentence(head_emb, text_len_mask)
 
         top_span_starts = gold_starts
         top_span_ends = gold_ends
-        top_span_emb = self.get_span_emb(flattened_head_emb, context_outputs, top_span_starts, top_span_ends)
-        candidate_NP_embeddings = tf.gather(top_span_emb, candidate_positions)  # [k, max_candidate, embedding]
-        candidate_starts = tf.gather(top_span_starts, candidate_positions)  # [k, max_candidate]
-        pronoun_starts = tf.gather(top_span_starts, pronoun_positions)  # [k, 1]
-        top_span_speaker_ids = tf.gather(speaker_ids, candidate_starts)  # [k]
 
-        pronoun_embedding = tf.gather(top_span_emb, pronoun_positions)  # [k, embedding]
-        pronoun_speaker_id = tf.gather(speaker_ids, pronoun_starts)  # [k, 1]
+        # get span emb [?, 1270]
+        top_span_emb = self.get_span_emb(flattened_head_emb, context_outputs, top_span_starts, top_span_ends)
+
+        # [k, max_candidate, embedding] [?, ?, 1270]
+        candidate_NP_embeddings = tf.gather(top_span_emb, candidate_positions)
+
+        # [k, max_candidate]
+        candidate_starts = tf.gather(top_span_starts, candidate_positions)
+
+        # [k, 1] [?, ?]
+        pronoun_starts = tf.gather(top_span_starts, pronoun_positions)
+
+        # [k] [?, ?]
+        top_span_speaker_ids = tf.gather(speaker_ids, candidate_starts)
+
+        # [k, embedding] [?,?,embedding]
+        pronoun_embedding = tf.gather(top_span_emb, pronoun_positions)
+
+        # [k, 1] [?, ?]
+        pronoun_speaker_id = tf.gather(speaker_ids, pronoun_starts)
 
         mention_offsets = tf.range(util.shape(top_span_emb, 0)) + 1
         candidate_NP_offsets = tf.gather(mention_offsets, candidate_positions)
@@ -333,15 +348,11 @@ class KnowledgePronounCorefModel(object):
             if self.config['knowledge_pruning']:
                 knowledge_score_after_softmax = tf.nn.softmax(knowledge_score, 1)  # [k, c]
                 knowledge_threshold = tf.ones([all_k, all_c]) * self.config['softmax_threshold']  # [k, c]
-                knowledge_ranking_mask = tf.to_float(tf.greater(knowledge_score_after_softmax, knowledge_threshold))  # [k, c]
+                knowledge_ranking_mask = tf.to_float(
+                    tf.greater(knowledge_score_after_softmax, knowledge_threshold))  # [k, c]
                 ranking_mask = ranking_mask * knowledge_ranking_mask
         else:
             knowledge_score = tf.zeros([all_k, all_c])
-            knowledge_score_after_softmax = tf.nn.softmax(knowledge_score, 1)  # [k, c]
-            merged_score = tf.zeros([all_k, all_c])
-            attention_score = tf.zeros([all_k, all_c])
-            diagonal_mask = tf.zeros([all_k, all_c])
-            square_mask = tf.zeros([all_k, all_c])
 
         top_antecedent_scores = tf.concat([dummy_scores, coreference_scores], 1)  # [k, c + 1]
         labels = tf.logical_and(labels, tf.greater(score_after_softmax, threshold))
@@ -362,7 +373,8 @@ class KnowledgePronounCorefModel(object):
                                  top_antecedent_labels)
         loss = tf.reduce_sum(loss)  # []
 
-        return [top_antecedent_scores * mask_for_prediction * ranking_mask_for_prediction, score_after_softmax*candidate_mask], loss
+        return [top_antecedent_scores * mask_for_prediction * ranking_mask_for_prediction,
+                score_after_softmax * candidate_mask], loss
 
     def get_knowledge_score(self, candidate_NP_embeddings, number_features, candidate_mask):
         k = util.shape(number_features, 0)
@@ -604,7 +616,7 @@ class KnowledgePronounCorefModel(object):
         return predicted_antecedents
 
     def load_eval_data(self):
-        print('path name:', self.config["eval_path"])
+        print('load eval data from:', self.config["eval_path"])
         if self.eval_data is None:
             def load_line(line):
                 example = json.loads(line)
@@ -628,11 +640,6 @@ class KnowledgePronounCorefModel(object):
         predict_coreference = 0
         corrct_predict_coreference = 0
 
-        result_by_pronoun_type = dict()
-        for tmp_pronoun_type in interested_pronouns:
-            result_by_pronoun_type[tmp_pronoun_type] = {'all_coreference': 0, 'predict_coreference': 0,
-                                                        'correct_predict_coreference': 0}
-        zero_counter = 0
         prediction_result = list()
         for example_num, (tensorized_example, example) in enumerate(separate_data):
             prediction_result_by_example = list()
@@ -640,45 +647,47 @@ class KnowledgePronounCorefModel(object):
             for s in example['sentences']:
                 all_sentence += s
 
-            _, _, _, _, _, _, _, _, _, gold_starts, gold_ends, number_features, candidate_NP_positions, pronoun_positions, labels, _ = tensorized_example
+            _, _, _, _, _, _, _, _, gold_starts, gold_ends, number_features, candidate_NP_positions, \
+            pronoun_positions, labels, _ = tensorized_example
 
             feed_dict = {i: t for i, t in zip(self.input_tensors, tensorized_example)}
-            pronoun_coref_scores = session.run(
-                self.predictions, feed_dict=feed_dict)
+            pronoun_coref_scores = session.run(self.predictions, feed_dict=feed_dict)
 
-            pronoun_coref_scores = pronoun_coref_scores[0]
+            pronoun_coref_scores = pronoun_coref_scores[0]  # [4, 4]
             gold_starts = list(gold_starts)
 
             for i, pronoun_coref_scores_by_example in enumerate(pronoun_coref_scores):
                 current_pronoun_index = int(pronoun_positions[i][0])
+
                 pronoun_position = gold_starts[current_pronoun_index]
-                current_pronoun = all_sentence[pronoun_position:pronoun_position + 1][0]
-                current_pronoun_type = get_pronoun_type(current_pronoun)
-                pronoun_coref_scores_by_example = pronoun_coref_scores_by_example[1:]
-                prediction_result_by_example.append(
-                    (pronoun_coref_scores_by_example.tolist(), labels[i], current_pronoun_type))
+                pronoun_position_end = gold_ends[current_pronoun_index] + 1
+
+                current_pronoun = ''.join(all_sentence[pronoun_position:pronoun_position_end])
+
+                pronoun_coref_scores_by_example = pronoun_coref_scores_by_example[1:]  # [1,3]
+
+                # labels [4, 3] bool
+                prediction_result_by_example.append((pronoun_coref_scores_by_example.tolist(), labels[i]))
+                
                 for j, tmp_score in enumerate(pronoun_coref_scores_by_example.tolist()):
                     if tmp_score > 0:
+                        current_candidate_index = int(candidate_NP_positions[i][j])
+                        candidate_positions = gold_starts[current_candidate_index]
+                        candidate_positions_end = gold_ends[current_candidate_index] + 1
+                        current_candidate = ''.join(all_sentence[candidate_positions:candidate_positions_end])
+                        msg = current_pronoun + '\t' + 'link to: ' + current_candidate + '\t'
                         predict_coreference += 1
-                        result_by_pronoun_type[current_pronoun_type]['predict_coreference'] += 1
                         if labels[i][j]:
                             corrct_predict_coreference += 1
-                            result_by_pronoun_type[current_pronoun_type]['correct_predict_coreference'] += 1
+                            msg += 'label:' + '\t' + 'true'
+                        else:
+                            msg += 'label:' + '\t' + 'false'
+                        print(msg)
                 for l in labels[i]:
                     if l:
                         all_coreference += 1
-                        result_by_pronoun_type[current_pronoun_type]['all_coreference'] += 1
             prediction_result.append(prediction_result_by_example)
-        for tmp_pronoun_type in interested_pronouns:
-            print('Pronoun type:', tmp_pronoun_type)
-            tmp_p = result_by_pronoun_type[tmp_pronoun_type]['correct_predict_coreference'] / \
-                    result_by_pronoun_type[tmp_pronoun_type]['predict_coreference']
-            tmp_r = result_by_pronoun_type[tmp_pronoun_type]['correct_predict_coreference'] / \
-                    result_by_pronoun_type[tmp_pronoun_type]['all_coreference']
-            tmp_f1 = 2 * tmp_p * tmp_r / (tmp_p + tmp_r)
-            print('p:', tmp_p)
-            print('r:', tmp_r)
-            print('f1:', tmp_f1)
+
         summary_dict = {}
         if predict_coreference > 0:
             p = corrct_predict_coreference / predict_coreference
