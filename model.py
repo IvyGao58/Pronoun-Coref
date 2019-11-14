@@ -234,10 +234,11 @@ class KnowledgePronounCorefModel(object):
         context_emb_list = [context_word_emb]
         head_emb_list = [head_word_emb]
 
+        # character emb
         if self.config["char_embedding_size"] > 0:
             # [num_sentences, max_sentence_length, max_word_length, emb]  [?, ?, ?, 8]
-            char_emb = tf.gather(tf.get_variable("char_embeddings", [len(self.char_dict),
-                                                                     self.config["char_embedding_size"]]), char_index)
+            value = tf.get_variable("char_embeddings", [len(self.char_dict), self.config["char_embedding_size"]])
+            char_emb = tf.gather(value, char_index)
 
             # [num_sentences * max_sentence_length, max_word_length, emb] [?, ?, 8]
             flattened_char_emb = tf.reshape(char_emb, [num_sentences * max_sentence_length, util.shape(char_emb, 2),
@@ -306,6 +307,9 @@ class KnowledgePronounCorefModel(object):
         # [k, max_candidate, embedding] [?, ?, 1270]
         candidate_NP_embeddings = tf.gather(top_span_emb, candidate_positions)
 
+        # [k, embedding] [?,?,1270]
+        pronoun_embedding = tf.gather(top_span_emb, pronoun_positions)
+
         # [k, max_candidate]
         candidate_starts = tf.gather(top_span_starts, candidate_positions)
 
@@ -314,9 +318,6 @@ class KnowledgePronounCorefModel(object):
 
         # [k] [?, ?]
         top_span_speaker_ids = tf.gather(speaker_ids, candidate_starts)
-
-        # [k, embedding] [?,?,embedding]
-        pronoun_embedding = tf.gather(top_span_emb, pronoun_positions)
 
         # [k, 1] [?, ?]
         pronoun_speaker_id = tf.gather(speaker_ids, pronoun_starts)
@@ -351,20 +352,24 @@ class KnowledgePronounCorefModel(object):
                 knowledge_ranking_mask = tf.to_float(
                     tf.greater(knowledge_score_after_softmax, knowledge_threshold))  # [k, c]
                 ranking_mask = ranking_mask * knowledge_ranking_mask
-        else:
-            knowledge_score = tf.zeros([all_k, all_c])
 
+        # dummy_scores为零向量，不需要softmax，所以让coreference_scores进softmax，再将output和dummy_scores进行concat。
         top_antecedent_scores = tf.concat([dummy_scores, coreference_scores], 1)  # [k, c + 1]
+
+        # labels为正，且得分在threshold之上的为True.
         labels = tf.logical_and(labels, tf.greater(score_after_softmax, threshold))
 
         dummy_mask_1 = tf.ones([k, 1])
         dummy_mask_0 = tf.zeros([k, 1])
+
         mask_for_prediction = tf.concat([dummy_mask_0, candidate_mask], 1)
         ranking_mask_for_prediction = tf.concat([dummy_mask_0, ranking_mask], 1)
+
         if self.config['random_sample_training']:
             random_mask = tf.greater(tf.random_uniform([all_k, all_c]), tf.ones([all_k, all_c]) * 0.3)
             labels = tf.logical_and(labels, random_mask)
             ranking_mask = ranking_mask * tf.to_float(random_mask)
+
         dummy_labels = tf.logical_not(tf.reduce_any(labels, 1, keepdims=True))  # [k, 1]
         top_antecedent_labels = tf.concat([dummy_labels, labels], 1)  # [k, c + 1]
         mask_for_training = tf.concat([dummy_mask_1, candidate_mask], 1)
@@ -393,7 +398,7 @@ class KnowledgePronounCorefModel(object):
             number_score = self.get_feature_score(number_emb, 'number_score')  # [k, c, c, 1]
         else:
             number_score = tf.zeros([k, c, c, 1])
-        merged_score = number_score  # [k, c, c, 4]
+        merged_score = number_score  # [k, c, c, 1]
 
         if self.config['attention']:
             if self.config['number']:
@@ -471,8 +476,8 @@ class KnowledgePronounCorefModel(object):
             span_emb_list.append(span_width_emb)
 
         if self.config["model_heads"]:
-            span_indices = tf.expand_dims(tf.range(self.config["max_span_width"]), 0) + tf.expand_dims(span_starts,
-                                                                                                       1)  # [k, max_span_width]
+            # [k, max_span_width]
+            span_indices = tf.expand_dims(tf.range(self.config["max_span_width"]), 0) + tf.expand_dims(span_starts, 1)
             span_indices = tf.minimum(util.shape(context_outputs, 0) - 1, span_indices)  # [k, max_span_width]
             span_text_emb = tf.gather(head_emb, span_indices)  # [k, max_span_width, emb]
             with tf.variable_scope("head_scores"):
@@ -543,12 +548,13 @@ class KnowledgePronounCorefModel(object):
                                    number_features)  # [k, c, feature_size]
             feature_emb_list.append(number_emb)
 
-        feature_emb = tf.concat(feature_emb_list, 2)  # [k, c, emb]
+        feature_emb = tf.concat(feature_emb_list, 2)  # [k, c, emb]  [?, ?, 40]
         feature_emb = tf.nn.dropout(feature_emb, self.dropout)  # [k, c, emb]
 
         target_emb = tf.tile(pronoun_emb, [1, c, 1])  # [k, c, emb]
         similarity_emb = candidate_NPs_emb * target_emb  # [k, c, emb]
 
+        # candidate_emb + pronoun_emb * candidate_emb + pronoun_emb
         pair_emb = tf.concat([target_emb, candidate_NPs_emb, similarity_emb, feature_emb], 2)  # [k, c, emb]
 
         with tf.variable_scope("slow_antecedent_scores"):
@@ -599,8 +605,8 @@ class KnowledgePronounCorefModel(object):
                 text_outputs = tf.concat([fw_outputs, bw_outputs], 2)  # [num_sentences, max_sentence_length, emb]
                 text_outputs = tf.nn.dropout(text_outputs, self.lstm_dropout)
                 if layer > 0:
-                    highway_gates = tf.sigmoid(util.projection(text_outputs, util.shape(text_outputs,
-                                                                                        2)))  # [num_sentences, max_sentence_length, emb]
+                    # [num_sentences, max_sentence_length, emb]
+                    highway_gates = tf.sigmoid(util.projection(text_outputs, util.shape(text_outputs, 2)))
                     text_outputs = highway_gates * text_outputs + (1 - highway_gates) * current_inputs
                 current_inputs = text_outputs
 
@@ -668,21 +674,23 @@ class KnowledgePronounCorefModel(object):
 
                 # labels [4, 3] bool
                 prediction_result_by_example.append((pronoun_coref_scores_by_example.tolist(), labels[i]))
-                
+
+                # print('current_pronoun: ', current_pronoun)
                 for j, tmp_score in enumerate(pronoun_coref_scores_by_example.tolist()):
+                    current_candidate_index = int(candidate_NP_positions[i][j])
+                    candidate_positions = gold_starts[current_candidate_index]
+                    candidate_positions_end = gold_ends[current_candidate_index] + 1
+                    current_candidate = ''.join(all_sentence[candidate_positions:candidate_positions_end])
+
                     if tmp_score > 0:
-                        current_candidate_index = int(candidate_NP_positions[i][j])
-                        candidate_positions = gold_starts[current_candidate_index]
-                        candidate_positions_end = gold_ends[current_candidate_index] + 1
-                        current_candidate = ''.join(all_sentence[candidate_positions:candidate_positions_end])
                         msg = current_pronoun + '\t' + 'link to: ' + current_candidate + '\t'
                         predict_coreference += 1
                         if labels[i][j]:
                             corrct_predict_coreference += 1
-                            msg += 'label:' + '\t' + 'true'
+                            msg += 'label:' + '\t' + 'true' + '\t' + 'pred score: ' + str(tmp_score)
                         else:
-                            msg += 'label:' + '\t' + 'false'
-                        print(msg)
+                            msg += 'label:' + '\t' + 'false' + '\t' + 'pred score: ' + str(tmp_score)
+                        # print(msg)
                 for l in labels[i]:
                     if l:
                         all_coreference += 1
@@ -706,4 +714,4 @@ class KnowledgePronounCorefModel(object):
             print('there is no positive prediction')
             f1 = 0
 
-        return util.make_summary(summary_dict), f1
+        return util.make_summary(summary_dict), f1, summary_dict

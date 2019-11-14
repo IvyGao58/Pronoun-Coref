@@ -168,7 +168,7 @@ def test_main():
     cmd.add_argument('--gpu', default=-1, type=int, help='use id of gpu, -1 if cpu.')
     cmd.add_argument('--input_format', default='conll', choices=('plain', 'conll', 'conll_char', 'conll_char_vi'),
                      help='the input format.')
-    cmd.add_argument("--input", default='../data/law/add/conll.dev.txt', help="the path to the raw text file.")
+    cmd.add_argument("--input", default='../data/law/conll.txt', help="the path to the raw text file.")
     cmd.add_argument("--output_format", default='hdf5', help='the output format. Supported format includes (hdf5, txt).'
                                                              ' Use comma to separate the format identifiers,'
                                                              ' like \'--output_format=hdf5,plain\'')
