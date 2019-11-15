@@ -45,6 +45,7 @@ class KnowledgePronounCorefModel(object):
         input_props.append((tf.int32, [None]))  # gold_starts.
         input_props.append((tf.int32, [None]))  # gold_ends.
         input_props.append((tf.int32, [None, None]))  # number_features.
+        input_props.append((tf.int32, [None, None]))  # plurality_features.
         input_props.append((tf.int32, [None, None]))  # candidate_positions.
         input_props.append((tf.int32, [None, None]))  # pronoun_positions.
         input_props.append((tf.bool, [None, None]))  # labels
@@ -192,15 +193,18 @@ class KnowledgePronounCorefModel(object):
                     break
 
         number_features = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])
+        plurality_features = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])
         for i, pronoun_example in enumerate(example['pronoun_info']):
             for j, tmp_np in enumerate(pronoun_example['candidate_NPs']):
                 tmp_encoded_name = str(tmp_np[0]) + '$' + str(tmp_np[1])
                 if tmp_encoded_name in pronoun_example['features']:
                     number_features[i, j] = pronoun_example['features'][tmp_encoded_name]['number']
+                    plurality_features[i, j] = pronoun_example['features'][tmp_encoded_name]['plurality']
 
         example_tensors = (
             tokens, context_word_emb, head_word_emb, lm_emb, char_index, text_len, speaker_ids, is_training,
-            gold_starts, gold_ends, number_features, candidate_NP_positions, pronoun_positions, labels, candidate_mask)
+            gold_starts, gold_ends, number_features, plurality_features, candidate_NP_positions, pronoun_positions,
+            labels, candidate_mask)
 
         return example_tensors
 
@@ -218,8 +222,8 @@ class KnowledgePronounCorefModel(object):
         return 1 - (tf.to_float(is_training) * dropout_rate)
 
     def get_predictions_and_loss(self, tokens, context_word_emb, head_word_emb, lm_emb, char_index, text_len,
-                                 speaker_ids, is_training, gold_starts, gold_ends,
-                                 number_features, candidate_positions, pronoun_positions, labels, candidate_mask):
+                                 speaker_ids, is_training, gold_starts, gold_ends, number_features, plurality_features,
+                                 candidate_positions, pronoun_positions, labels, candidate_mask):
         all_k = util.shape(number_features, 0)
         all_c = util.shape(number_features, 1)
 
@@ -332,7 +336,8 @@ class KnowledgePronounCorefModel(object):
                 coreference_scores = self.get_coreference_score(candidate_NP_embeddings, pronoun_embedding,
                                                                 top_span_speaker_ids,
                                                                 pronoun_speaker_id, candidate_NP_offsets,
-                                                                pronoun_offsets, number_features)  # [k, c]
+                                                                pronoun_offsets, number_features,
+                                                                plurality_features)  # [k, c]
         score_after_softmax = tf.nn.softmax(coreference_scores, 1)  # [k, c]
         if self.config['softmax_pruning']:
             threshold = tf.ones([all_k, all_c]) * self.config['softmax_threshold']  # [k, c]
@@ -342,8 +347,9 @@ class KnowledgePronounCorefModel(object):
 
         if self.config['apply_knowledge']:
             with tf.variable_scope("knowledge_layer"):
+                # [k, c]
                 knowledge_score, merged_score, attention_score, diagonal_mask, square_mask = self.get_knowledge_score(
-                    candidate_NP_embeddings, number_features, candidate_mask * ranking_mask)  # [k, c]
+                    candidate_NP_embeddings, number_features, plurality_features, candidate_mask * ranking_mask)
 
             coreference_scores = coreference_scores + knowledge_score  # [k, c]
             if self.config['knowledge_pruning']:
@@ -381,7 +387,7 @@ class KnowledgePronounCorefModel(object):
         return [top_antecedent_scores * mask_for_prediction * ranking_mask_for_prediction,
                 score_after_softmax * candidate_mask], loss
 
-    def get_knowledge_score(self, candidate_NP_embeddings, number_features, candidate_mask):
+    def get_knowledge_score(self, candidate_NP_embeddings, number_features, plurality_features, candidate_mask):
         k = util.shape(number_features, 0)
         c = util.shape(number_features, 1)
 
@@ -393,12 +399,20 @@ class KnowledgePronounCorefModel(object):
         # we need to find the embedding for these features
         number_emb = tf.gather(tf.get_variable("number_emb", [2, self.config["feature_size"]]),
                                number_features)  # [k, c, feature_size]
+        plurality_emb = tf.gather(tf.get_variable("plurality_emb", [2, self.config["feature_size"]]),
+                                  plurality_features)  # [k, c, feature_size]
 
         if self.config['number']:
             number_score = self.get_feature_score(number_emb, 'number_score')  # [k, c, c, 1]
         else:
             number_score = tf.zeros([k, c, c, 1])
-        merged_score = number_score  # [k, c, c, 1]
+
+        if self.config['plurality']:
+            plurality_score = self.get_feature_score(plurality_emb, 'plurality_score')  # [k, c, c, 1]
+        else:
+            plurality_score = tf.zeros([k, c, c, 1])
+
+        merged_score = tf.concat([number_score, plurality_score], 3)  # [k, c, c, 2]
 
         if self.config['attention']:
             if self.config['number']:
@@ -407,8 +421,14 @@ class KnowledgePronounCorefModel(object):
             else:
                 number_attention_score = tf.ones([k, c, c, 1]) * -1000
 
-            merged_attention_score = number_attention_score
-            all_attention_scores = tf.nn.softmax(merged_attention_score, 3)  # [k, c, c, 4]
+            if self.config['plurality']:
+                plurality_attention_score = self.get_feature_attention_score(plurality_emb, candidate_NP_embeddings,
+                                                                             'plurality_attention_score')
+            else:
+                plurality_attention_score = tf.ones([k, c, c, 1]) * -1000
+
+            merged_attention_score = tf.concat([number_attention_score, plurality_attention_score], 3)
+            all_attention_scores = tf.nn.softmax(merged_attention_score, 3)  # [k, c, c, 2]
             all_scores = merged_score * all_attention_scores
         else:
             all_scores = merged_score
@@ -524,7 +544,7 @@ class KnowledgePronounCorefModel(object):
         return tf.clip_by_value(combined_idx, 0, 9)
 
     def get_coreference_score(self, candidate_NPs_emb, pronoun_emb, candidate_NPs_speaker_ids, pronoun_speaker_id,
-                              candidate_NP_offsets, pronoun_offsets, number_features):
+                              candidate_NP_offsets, pronoun_offsets, number_features, plurality_features):
         k = util.shape(candidate_NPs_emb, 0)
         c = util.shape(candidate_NPs_emb, 1)
 
@@ -546,7 +566,10 @@ class KnowledgePronounCorefModel(object):
         if self.config['knowledge_as_feature']:
             number_emb = tf.gather(tf.get_variable("number_emb", [2, self.config["feature_size"]]),
                                    number_features)  # [k, c, feature_size]
+            plurality_emb = tf.gather(tf.get_variable("plurality_emb", [2, self.config["feature_size"]]),
+                                      plurality_features)  # [k, c, feature_size]
             feature_emb_list.append(number_emb)
+            feature_emb_list.append(plurality_emb)
 
         feature_emb = tf.concat(feature_emb_list, 2)  # [k, c, emb]  [?, ?, 40]
         feature_emb = tf.nn.dropout(feature_emb, self.dropout)  # [k, c, emb]
@@ -594,13 +617,12 @@ class KnowledgePronounCorefModel(object):
                 state_bw = tf.contrib.rnn.LSTMStateTuple(tf.tile(cell_bw.initial_state.c, [num_sentences, 1]),
                                                          tf.tile(cell_bw.initial_state.h, [num_sentences, 1]))
 
-                (fw_outputs, bw_outputs), _ = tf.nn.bidirectional_dynamic_rnn(
-                    cell_fw=cell_fw,
-                    cell_bw=cell_bw,
-                    inputs=current_inputs,
-                    sequence_length=text_len,
-                    initial_state_fw=state_fw,
-                    initial_state_bw=state_bw)
+                (fw_outputs, bw_outputs), _ = tf.nn.bidirectional_dynamic_rnn(cell_fw=cell_fw,
+                                                                              cell_bw=cell_bw,
+                                                                              inputs=current_inputs,
+                                                                              sequence_length=text_len,
+                                                                              initial_state_fw=state_fw,
+                                                                              initial_state_bw=state_bw)
 
                 text_outputs = tf.concat([fw_outputs, bw_outputs], 2)  # [num_sentences, max_sentence_length, emb]
                 text_outputs = tf.nn.dropout(text_outputs, self.lstm_dropout)
@@ -657,8 +679,8 @@ class KnowledgePronounCorefModel(object):
             for s in example['sentences']:
                 all_sentence += s
 
-            _, _, _, _, _, _, _, _, gold_starts, gold_ends, number_features, candidate_NP_positions, \
-            pronoun_positions, labels, _ = tensorized_example
+            _, _, _, _, _, _, _, _, gold_starts, gold_ends, number_features, plurality_features, \
+            candidate_NP_positions, pronoun_positions, labels, _ = tensorized_example
 
             feed_dict = {i: t for i, t in zip(self.input_tensors, tensorized_example)}
             pronoun_coref_scores = session.run(self.predictions, feed_dict=feed_dict)
