@@ -7,4 +7,4 @@ unzip glove.840B.300d.zip
 rm glove.840B.300d.zip
 
 # python filter_embeddings.py glove.840B.300d.txt data/train.jsonlines data/dev.jsonlines data/test.jsonlines
-python filter_embeddings.py chinese_emb/sgns.zhihu.word data/law/train.jsonlines data/law/dev.jsonlines
+python filter_embeddings.py chinese_emb/sgns.zhihu.word data/law/train.jsonlines data/law/dev.jsonlines data/law/test.jsonlines

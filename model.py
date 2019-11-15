@@ -633,8 +633,7 @@ class KnowledgePronounCorefModel(object):
             num_words = sum(tensorized_example[2].sum() for tensorized_example, _ in self.eval_data)
             print("Loaded {} eval examples.".format(len(self.eval_data)))
 
-    def evaluate(self, session, evaluation_data=None, official_stdout=False):
-
+    def evaluate(self, session, evaluation_data=None, official_stdout=False, mode='train', title_map=None):
         if evaluation_data:
             separate_data = list()
             for tmp_example in evaluation_data:
@@ -650,6 +649,11 @@ class KnowledgePronounCorefModel(object):
         for example_num, (tensorized_example, example) in enumerate(separate_data):
             prediction_result_by_example = list()
             all_sentence = list()
+
+            doc_id = example['doc_key']
+            if mode == 'test':
+                print(title_map[doc_id])
+
             for s in example['sentences']:
                 all_sentence += s
 
@@ -675,7 +679,6 @@ class KnowledgePronounCorefModel(object):
                 # labels [4, 3] bool
                 prediction_result_by_example.append((pronoun_coref_scores_by_example.tolist(), labels[i]))
 
-                # print('current_pronoun: ', current_pronoun)
                 for j, tmp_score in enumerate(pronoun_coref_scores_by_example.tolist()):
                     current_candidate_index = int(candidate_NP_positions[i][j])
                     candidate_positions = gold_starts[current_candidate_index]
@@ -687,10 +690,11 @@ class KnowledgePronounCorefModel(object):
                         predict_coreference += 1
                         if labels[i][j]:
                             corrct_predict_coreference += 1
-                            msg += 'label:' + '\t' + 'true' + '\t' + 'pred score: ' + str(tmp_score)
+                            msg += 'true' + '\t' + 'pred score: ' + str(tmp_score)
                         else:
-                            msg += 'label:' + '\t' + 'false' + '\t' + 'pred score: ' + str(tmp_score)
-                        # print(msg)
+                            msg += 'false' + '\t' + 'pred score: ' + str(tmp_score)
+                        if mode == 'test':
+                            print(msg)
                 for l in labels[i]:
                     if l:
                         all_coreference += 1
@@ -714,4 +718,4 @@ class KnowledgePronounCorefModel(object):
             print('there is no positive prediction')
             f1 = 0
 
-        return util.make_summary(summary_dict), f1, summary_dict
+        return util.make_summary(summary_dict), f1
