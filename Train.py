@@ -7,8 +7,9 @@ import os
 import time
 
 import tensorflow as tf
+
+import BiAffineModel as model
 import util
-import model
 
 if __name__ == "__main__":
     config = util.initialize_from_env()
@@ -24,7 +25,10 @@ if __name__ == "__main__":
 
     max_f1 = 0
 
-    with tf.Session() as session:
+    default_config = tf.ConfigProto()
+    default_config.gpu_options.allow_growth = True
+
+    with tf.Session(config=default_config) as session:
         writer = tf.summary.FileWriter(log_dir, session.graph, flush_secs=20)
         print('begin to initialize global variables...')
         session.run(tf.global_variables_initializer())

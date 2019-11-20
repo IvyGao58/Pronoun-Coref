@@ -15,6 +15,7 @@ import numpy as np
 import tensorflow as tf
 import pyhocon
 from pycorenlp import StanfordCoreNLP
+import six
 
 
 def initialize_from_env():
@@ -29,7 +30,7 @@ def initialize_from_env():
     config = pyhocon.ConfigFactory.parse_file("experiments.conf")[name]
     config["log_dir"] = mkdirs(os.path.join(config["log_root"], name))
 
-    print(pyhocon.HOCONConverter.convert(config, "hocon"))
+    # print(pyhocon.HOCONConverter.convert(config, "hocon"))
     return config
 
 
@@ -125,13 +126,14 @@ def ffnn(inputs, num_hidden_layers, hidden_size, output_size, dropout, output_we
     return outputs
 
 
-def cnn(inputs, filter_sizes, num_filters):
+def cnn(inputs, filter_sizes, num_filters, name=None):
     num_words = shape(inputs, 0)
     num_chars = shape(inputs, 1)
     input_size = shape(inputs, 2)
     outputs = []
     for i, filter_size in enumerate(filter_sizes):
-        with tf.variable_scope("conv_{}".format(i)):
+        conv_name = i if name is None else name + str(i)
+        with tf.variable_scope("conv_{}".format(conv_name)):
             w = tf.get_variable("w", [filter_size, input_size, num_filters])
             b = tf.get_variable("b", [num_filters])
         conv = tf.nn.conv1d(inputs, w, stride=1, padding="VALID")  # [num_words, num_chars - filter_size, num_filters]
@@ -295,6 +297,338 @@ def get_pronoun_type(input_pronoun):
             return tmp_type
 
 
+def attention_layer(from_tensor,
+                    to_tensor,
+                    attention_mask=None,
+                    num_attention_heads=1,
+                    size_per_head=256,
+                    query_act=None,
+                    key_act=None,
+                    value_act=None,
+                    attention_probs_dropout_prob=0.0,
+                    initializer_range=0.02,
+                    do_return_2d_tensor=False,
+                    batch_size=None,
+                    from_seq_length=None,
+                    to_seq_length=None):
+    """Performs multi-headed attention from `from_tensor` to `to_tensor`.
+    This is an implementation of multi-headed attention based on "Attention
+    is all you Need". If `from_tensor` and `to_tensor` are the same, then
+    this is self-attention. Each timestep in `from_tensor` attends to the
+    corresponding sequence in `to_tensor`, and returns a fixed-with vector.
+    This function first projects `from_tensor` into a "query" tensor and
+    `to_tensor` into "key" and "value" tensors. These are (effectively) a list
+    of tensors of length `num_attention_heads`, where each tensor is of shape
+    [batch_size, seq_length, size_per_head].
+    Then, the query and key tensors are dot-producted and scaled. These are
+    softmaxed to obtain attention probabilities. The value tensors are then
+    interpolated by these probabilities, then concatenated back to a single
+    tensor and returned.
+    In practice, the multi-headed attention are done with transposes and
+    reshapes rather than actual separate tensors.
+    Args:
+      from_tensor: float Tensor of shape [batch_size, from_seq_length,
+        from_width].
+      to_tensor: float Tensor of shape [batch_size, to_seq_length, to_width].
+      attention_mask: (optional) int32 Tensor of shape [batch_size,
+        from_seq_length, to_seq_length]. The values should be 1 or 0. The
+        attention scores will effectively be set to -infinity for any positions in
+        the mask that are 0, and will be unchanged for positions that are 1.
+      num_attention_heads: int. Number of attention heads.
+      size_per_head: int. Size of each attention head.
+      query_act: (optional) Activation function for the query transform.
+      key_act: (optional) Activation function for the key transform.
+      value_act: (optional) Activation function for the value transform.
+      attention_probs_dropout_prob: (optional) float. Dropout probability of the
+        attention probabilities.
+      initializer_range: float. Range of the weight initializer.
+      do_return_2d_tensor: bool. If True, the output will be of shape [batch_size
+        * from_seq_length, num_attention_heads * size_per_head]. If False, the
+        output will be of shape [batch_size, from_seq_length, num_attention_heads
+        * size_per_head].
+      batch_size: (Optional) int. If the input is 2D, this might be the batch size
+        of the 3D version of the `from_tensor` and `to_tensor`.
+      from_seq_length: (Optional) If the input is 2D, this might be the seq length
+        of the 3D version of the `from_tensor`.
+      to_seq_length: (Optional) If the input is 2D, this might be the seq length
+        of the 3D version of the `to_tensor`.
+    Returns:
+      float Tensor of shape [batch_size, from_seq_length,
+        num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
+        true, this will be of shape [batch_size * from_seq_length,
+        num_attention_heads * size_per_head]).
+    Raises:
+      ValueError: Any of the arguments or tensor shapes are invalid.
+    """
+
+    def transpose_for_scores(input_tensor, batch_size, num_attention_heads, seq_length, width):
+        output_tensor = tf.reshape(input_tensor, [batch_size, seq_length, num_attention_heads, width])
+        output_tensor = tf.transpose(output_tensor, [0, 2, 1, 3])
+        return output_tensor
+
+    from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
+    to_shape = get_shape_list(to_tensor, expected_rank=[2, 3])
+
+    if len(from_shape) != len(to_shape):
+        raise ValueError("The rank of `from_tensor` must match the rank of `to_tensor`.")
+
+    if len(from_shape) == 3:
+        batch_size = from_shape[0]
+        from_seq_length = from_shape[1]
+        to_seq_length = to_shape[1]
+
+    elif len(from_shape) == 2:
+        if batch_size is None or from_seq_length is None or to_seq_length is None:
+            raise ValueError(
+                "When passing in rank 2 tensors to attention_layer, the values "
+                "for `batch_size`, `from_seq_length`, and `to_seq_length` "
+                "must all be specified.")
+
+    # Scalar dimensions referenced here:
+    #   B = batch size (number of sequences)
+    #   F = `from_tensor` sequence length
+    #   T = `to_tensor` sequence length
+    #   N = `num_attention_heads`
+    #   H = `size_per_head`
+
+    from_tensor_2d = reshape_to_matrix(from_tensor)
+    to_tensor_2d = reshape_to_matrix(to_tensor)
+
+    # `query_layer` = [B*F, N*H]
+    query_layer = tf.layers.dense(
+        from_tensor_2d,
+        num_attention_heads * size_per_head,
+        activation=query_act,
+        name="query",
+        kernel_initializer=create_initializer(initializer_range))
+
+    # `key_layer` = [B*T, N*H]
+    key_layer = tf.layers.dense(
+        to_tensor_2d,
+        num_attention_heads * size_per_head,
+        activation=key_act,
+        name="key",
+        kernel_initializer=create_initializer(initializer_range))
+
+    # `value_layer` = [B*T, N*H]
+    value_layer = tf.layers.dense(
+        to_tensor_2d,
+        num_attention_heads * size_per_head,
+        activation=value_act,
+        name="value",
+        kernel_initializer=create_initializer(initializer_range))
+
+    # `query_layer` = [B, N, F, H]
+    query_layer = transpose_for_scores(query_layer, batch_size,
+                                       num_attention_heads, from_seq_length,
+                                       size_per_head)
+
+    # `key_layer` = [B, N, T, H]
+    key_layer = transpose_for_scores(key_layer, batch_size, num_attention_heads,
+                                     to_seq_length, size_per_head)
+
+    # Take the dot product between "query" and "key" to get the raw attention scores.
+    # `attention_scores` = [B, N, F, T]
+    attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
+    attention_scores = tf.multiply(attention_scores, 1.0 / math.sqrt(float(size_per_head)))
+
+    if attention_mask is not None:
+        # `attention_mask` = [B, 1, F, T]
+        attention_mask = tf.expand_dims(attention_mask, axis=[1])
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
+
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        attention_scores += adder
+
+    # Normalize the attention scores to probabilities.
+    # `attention_probs` = [B, N, F, T]
+    attention_probs = tf.nn.softmax(attention_scores)
+
+    # This is actually dropping out entire tokens to attend to, which might
+    # seem a bit unusual, but is taken from the original Transformer paper.
+    attention_probs = dropout(attention_probs, attention_probs_dropout_prob)
+
+    # `value_layer` = [B, T, N, H]
+    value_layer = tf.reshape(
+        value_layer,
+        [batch_size, to_seq_length, num_attention_heads, size_per_head])
+
+    # `value_layer` = [B, N, T, H]
+    value_layer = tf.transpose(value_layer, [0, 2, 1, 3])
+
+    # `context_layer` = [B, N, F, H]
+    context_layer = tf.matmul(attention_probs, value_layer)
+
+    # `context_layer` = [B, F, N, H]
+    context_layer = tf.transpose(context_layer, [0, 2, 1, 3])
+
+    if do_return_2d_tensor:
+        # `context_layer` = [B*F, N*H]
+        context_layer = tf.reshape(
+            context_layer,
+            [batch_size * from_seq_length, num_attention_heads * size_per_head])
+    else:
+        # `context_layer` = [B, F, N*H]
+        context_layer = tf.reshape(
+            context_layer,
+            [batch_size, from_seq_length, num_attention_heads * size_per_head])
+
+    return context_layer
+
+
+def biaffine_layer(input1, input2, out_features, bias=(True, True)):
+    in1_features = shape(input1, 2)  # 256
+    in2_features = shape(input2, 2)  # 256
+
+    linear_input_size = in1_features + int(bias[0])
+    linear_output_size = out_features * (in2_features + int(bias[1]))
+
+    batch_size = shape(input1, 0)
+
+    len1 = shape(input1, 1)
+    dim1 = shape(input1, 2)
+
+    len2 = shape(input2, 1)
+    dim2 = shape(input2, 2)
+
+    if bias[0]:
+        ones = tf.ones([batch_size, len1, 1], dtype=tf.float32, name=None)
+        input1 = tf.concat((input1, ones), axis=2)
+        dim1 += 1
+
+    if bias[1]:
+        ones = tf.ones([batch_size, len2, 1], dtype=tf.float32, name=None)
+        input2 = tf.concat((input2, ones), axis=2)
+        dim2 += 1
+
+    # linear: dm1 -> dm2 x out
+    input1 = tf.squeeze(input1, 0)
+    affine = tf.layers.dense(input1, linear_output_size, name="biaffine_dense",
+                             kernel_initializer=create_initializer(0.02))
+
+    # dense_weights = tf.get_variable("dense_weights", [linear_input_size, linear_output_size])
+    # dense_bias = tf.get_variable("dense_bias", [linear_output_size])
+    # affine = tf.nn.xw_plus_b(input1, dense_weights, dense_bias)
+
+    affine = tf.expand_dims(affine, 0)  # [1,?,514]
+    affine = tf.reshape(affine, [batch_size, len1 * out_features, dim2])  # batch, len1 x out_features, dm2
+
+    # input2 = torch.transpose(input2, 1, 2)  # batch_size, dim2, len2
+    input2 = tf.transpose(input2, [0, 2, 1])
+
+    biaffine = tf.transpose(tf.matmul(affine, input2), [0, 2, 1])
+
+    biaffine = tf.reshape(biaffine, [batch_size, len2, len1, out_features])
+    #  batch, len2, len1 x out  -> batch, len2, len1, out
+
+    biaffine = tf.transpose(biaffine, [0, 2, 1, 3])
+    # batch, len1, len2, out
+
+    return biaffine
+
+
+def create_initializer(initializer_range=0.02):
+    """Creates a `truncated_normal_initializer` with the given range."""
+    return tf.truncated_normal_initializer(stddev=initializer_range)
+
+
+def dropout(input_tensor, dropout_prob):
+    """Perform dropout.
+    Args:
+      input_tensor: float Tensor.
+      dropout_prob: Python float. The probability of dropping out a value (NOT of
+        *keeping* a dimension as in `tf.nn.dropout`).
+    Returns:
+      A version of `input_tensor` with dropout applied.
+    """
+    if dropout_prob is None or dropout_prob == 0.0:
+        return input_tensor
+
+    output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+    return output
+
+
+def reshape_to_matrix(input_tensor):
+    """Reshapes a >= rank 2 tensor to a rank 2 tensor (i.e., a matrix)."""
+    ndims = input_tensor.shape.ndims
+    if ndims < 2:
+        raise ValueError("Input tensor must have at least rank 2. Shape = %s" % input_tensor.shape)
+    if ndims == 2:
+        return input_tensor
+
+    width = input_tensor.shape[-1]
+    output_tensor = tf.reshape(input_tensor, [-1, width])
+    return output_tensor
+
+
+def get_shape_list(tensor, expected_rank=None, name=None):
+    """Returns a list of the shape of tensor, preferring static dimensions.
+    Args:
+      tensor: A tf.Tensor object to find the shape of.
+      expected_rank: (optional) int. The expected rank of `tensor`. If this is
+        specified and the `tensor` has a different rank, and exception will be
+        thrown.
+      name: Optional name of the tensor for the error message.
+    Returns:
+      A list of dimensions of the shape of tensor. All static dimensions will
+      be returned as python integers, and dynamic dimensions will be returned
+      as tf.Tensor scalars.
+    """
+    if name is None:
+        name = tensor.name
+
+    if expected_rank is not None:
+        assert_rank(tensor, expected_rank, name)
+
+    shape = tensor.shape.as_list()
+
+    non_static_indexes = []
+    for (index, dim) in enumerate(shape):
+        if dim is None:
+            non_static_indexes.append(index)
+
+    if not non_static_indexes:
+        return shape
+
+    dyn_shape = tf.shape(tensor)
+    for index in non_static_indexes:
+        shape[index] = dyn_shape[index]
+    return shape
+
+
+def assert_rank(tensor, expected_rank, name=None):
+    """Raises an exception if the tensor rank is not of the expected rank.
+    Args:
+      tensor: A tf.Tensor to check the rank of.
+      expected_rank: Python integer or list of integers, expected rank.
+      name: Optional name of the tensor for the error message.
+    Raises:
+      ValueError: If the expected shape doesn't match the actual shape.
+    """
+    if name is None:
+        name = tensor.name
+
+    expected_rank_dict = {}
+    if isinstance(expected_rank, six.integer_types):
+        expected_rank_dict[expected_rank] = True
+    else:
+        for x in expected_rank:
+            expected_rank_dict[x] = True
+
+    actual_rank = tensor.shape.ndims
+    if actual_rank not in expected_rank_dict:
+        scope_name = tf.get_variable_scope().name
+        raise ValueError(
+            "For the tensor `%s` in scope `%s`, the actual rank "
+            "`%d` (shape = %s) is not equal to the expected rank `%s`" %
+            (name, scope_name, actual_rank, str(tensor.shape), str(expected_rank)))
+
+
 third_personal_pronouns = ['she', 'her', 'he', 'him', 'them', 'they', 'She', 'Her', 'He', 'Him', 'Them',
                            'They', 'it', 'It']
 
@@ -313,9 +647,10 @@ indefinite_pronouns = ['anybody', 'anyone', 'anything', 'each', 'either', 'every
 reflexive_pronouns = ['myself', 'ourselves', 'yourself', 'yourselves', 'himself', 'herself', 'itself', 'themselves',
                       'Myself', 'Ourselves', 'Yourself', 'Yourselves', 'Himself', 'Herself', 'Itself', 'Themselves']
 interrogative_pronouns = ['what', 'who', 'which', 'whom', 'whose', 'What', 'Who', 'Which', 'Whom', 'Whose']
-all_possessive_pronoun = ['my', 'your', 'his', 'her', 'its', 'our', 'your', 'their', 'mine', 'yours', 'his', 'hers', 'ours',
-                      'yours', 'theirs', 'My', 'Your', 'His', 'Her', 'Its', 'Our', 'Your', 'Their', 'Mine', 'Yours',
-                      'His', 'Hers', 'Ours', 'Yours', 'Theirs']
+all_possessive_pronoun = ['my', 'your', 'his', 'her', 'its', 'our', 'your', 'their', 'mine', 'yours', 'his', 'hers',
+                          'ours',
+                          'yours', 'theirs', 'My', 'Your', 'His', 'Her', 'Its', 'Our', 'Your', 'Their', 'Mine', 'Yours',
+                          'His', 'Hers', 'Ours', 'Yours', 'Theirs']
 possessive_pronoun = ['his', 'hers', 'its', 'their', 'theirs', 'His', 'Hers', 'Its', 'Their', 'Theirs']
 
 all_pronouns_by_type = dict()
@@ -334,4 +669,3 @@ interested_pronouns = ['third_personal', 'possessive']
 interested_entity_types = ['NATIONALITY', 'ORGANIZATION', 'PERSON', 'DATE', 'CAUSE_OF_DEATH', 'CITY', 'LOCATION',
                            'NUMBER', 'TITLE', 'TIME', 'ORDINAL', 'DURATION', 'MISC', 'COUNTRY', 'SET', 'PERCENT',
                            'STATE_OR_PROVINCE', 'MONEY', 'CRIMINAL_CHARGE', 'IDEOLOGY', 'RELIGION', 'URL', 'EMAIL']
-
