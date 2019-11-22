@@ -382,9 +382,9 @@ class KnowledgePronounCorefModel(object):
         top_span_starts = gold_starts
         top_span_ends = gold_ends
 
-        top_status_span_emb = self.get_status_span_emb(flattened_head_emb, context_outputs, status_gold_starts,
-                                                       status_gold_ends)
-        status_embedding = tf.gather(top_status_span_emb, status_positions)
+        # top_status_span_emb = self.get_status_span_emb(flattened_head_emb, context_outputs, status_gold_starts,
+        #                                                status_gold_ends)
+        # status_embedding = tf.gather(top_status_span_emb, status_positions)
 
         # get span emb [?, 1270]
         top_span_emb = self.get_span_emb(flattened_head_emb, context_outputs, top_span_starts, top_span_ends)
@@ -428,9 +428,8 @@ class KnowledgePronounCorefModel(object):
                                                                 pronoun_offsets, number_features)  # [k, c]
 
         # attention
-        # print_pronoun_embedding = tf.Print(pronoun_embedding, [pronoun_embedding])
-
-        emb_list = [pronoun_embedding, name_embedding, status_embedding]
+        # emb_list = [pronoun_embedding, name_embedding, status_embedding]
+        emb_list = [pronoun_embedding, name_embedding]
         attn_out = self.use_attention(emb_list)  # [1, ?, 256]
         # bi-affine
         mat_score = self.use_biaffine(attn_out, p_len, m_len)
@@ -477,13 +476,15 @@ class KnowledgePronounCorefModel(object):
 
     def use_attention(self, emb_list):
         # flattened_pronoun_emb, flattened_name_emb = self.emb2cnn(emb_list)
-        pronoun_embedding, name_embedding, status_embedding = emb_list
+        # pronoun_embedding, name_embedding, status_embedding = emb_list
+        pronoun_embedding, name_embedding = emb_list
 
         pronoun_embedding = tf.squeeze(pronoun_embedding, 1)  # [k1, emb]
         name_embedding = tf.squeeze(name_embedding, 1)  # [k2, emb]
-        status_embedding = tf.squeeze(status_embedding, 1)
+        # status_embedding = tf.squeeze(status_embedding, 1)
 
-        flattened_emb = tf.concat([pronoun_embedding, name_embedding, status_embedding], 0)  # [k1+k2, emb]
+        # flattened_emb = tf.concat([pronoun_embedding, name_embedding, status_embedding], 0)  # [k1+k2, emb]
+        flattened_emb = tf.concat([pronoun_embedding, name_embedding], 0)  # [k1+k2, emb]
         flattened_emb = tf.expand_dims(flattened_emb, 0)  # [1, k1+k2, emb]
 
         # [1, ?, 256]
@@ -491,8 +492,8 @@ class KnowledgePronounCorefModel(object):
         return attn_out
 
     def use_biaffine(self, attn_out, p_len, m_len):
-        p_m_out = attn_out[:, :p_len+m_len, :]
-        biaffine = util.biaffine_layer(p_m_out, p_m_out, self.config["size_per_head"],
+        # p_m_out = attn_out[:, :p_len+m_len, :]
+        biaffine = util.biaffine_layer(attn_out, attn_out, self.config["size_per_head"],
                                        self.config["biaffine_out_features"])  # [1, k+c, k+c, 2]
         biaffine = tf.squeeze(biaffine, 0)  # [k+c, k+c, 2]
 
@@ -640,13 +641,19 @@ class KnowledgePronounCorefModel(object):
         reshaped_span_starts = tf.reshape(span_starts, [dim0 * dim1])  # [a*b]
         gathered_span_starts = tf.gather(context_outputs, reshaped_span_starts)  # [a*b, emb]
         cnn_span_starts = tf.reshape(gathered_span_starts, [dim0, dim1, emb_size])  # [a, b, emb]
-        span_start_emb = util.cnn(cnn_span_starts, self.config["emb_filter_widths"], emb_size, 'span_starts')  # [k, emb]
+
+        span_starts_4dim = tf.expand_dims(cnn_span_starts, 3)
+
+        # [a, emb]
+        span_start_emb = util.cnn2d(span_starts_4dim, self.config["emb_filter_widths"], ffnn_out_size=emb_size, name="start")
         span_emb_list.append(span_start_emb)
 
         reshaped_span_ends = tf.reshape(span_ends, [dim0 * dim1])
         gathered_span_ends = tf.gather(context_outputs, reshaped_span_ends)
         cnn_span_ends = tf.reshape(gathered_span_ends, [dim0, dim1, emb_size])
-        span_end_emb = util.cnn(cnn_span_ends, self.config["emb_filter_widths"], emb_size, 'span_ends')  # [k, emb]
+
+        span_ends_4dim = tf.expand_dims(cnn_span_ends, 3)
+        span_end_emb = util.cnn2d(span_ends_4dim, self.config["emb_filter_widths"], ffnn_out_size=emb_size, name="end")
         span_emb_list.append(span_end_emb)
 
         span_starts = tf.squeeze(span_starts[:, :1], 1)  # todo model_heads
@@ -872,6 +879,7 @@ class KnowledgePronounCorefModel(object):
                     candidate_positions_end = int(sliced_gold_ends[current_candidate_index]) + 1
                     current_candidate = ''.join(all_sentence[candidate_positions_start:candidate_positions_end])
                     if tmp_score > 0:
+                        print(tmp_score)
                         msg = current_pronoun + '\t' + 'link to: ' + current_candidate + '\t'
                         predict_coreference += 1
                         if labels[i][j]:

@@ -126,6 +126,36 @@ def ffnn(inputs, num_hidden_layers, hidden_size, output_size, dropout, output_we
     return outputs
 
 
+def cnn2d(inputs, filter_sizes, in_channels=1, out_channels=128, ffnn_out_size=128, name=None):
+    """
+    :param inputs: 4d tensor [batch_size, in_height, in_width, in_channels]
+    :param filter_sizes:  4d tensor [filter_height, filter_width, in_channels, out_channels]
+    :param in_channels: 1
+    :param out_channels: 卷积核个数
+    :param name:
+    :return:
+    """
+    batch_size = shape(inputs, 0)
+    emb_size = shape(inputs, 2)  # width
+    outputs = []
+    for i, filter_size in enumerate(filter_sizes):
+        conv_name = i if name is None else name + str(i)
+        with tf.variable_scope("conv_{}".format(conv_name)):
+            filters = tf.get_variable("filters_{}".format(i), [filter_size, emb_size, in_channels, out_channels])
+        conv2 = tf.nn.conv2d(inputs, filters, strides=[1, 1, 1, 1], padding="SAME")  # [1, M ,N, out_channels]
+        reshaped_conv2 = tf.reshape(conv2, [batch_size, -1, out_channels])
+        h = tf.nn.relu(reshaped_conv2)
+        pooled = tf.reduce_max(h, 1)  # [Batch, out_channel]
+        outputs.append(pooled)
+    concat_output = tf.concat(outputs, 1)  # [Batch, out_channels*len(filter_sizes)]
+    reshape_output = tf.reshape(concat_output, [batch_size, -1])  # [Batch, len * output_channels]
+    hidden_weights = tf.get_variable("con2d_dense_weights_{}".format(name),
+                                     [len(filter_sizes) * out_channels, ffnn_out_size])
+    hidden_bias = tf.get_variable("conv2d_dense_bias_{}".format(name), [ffnn_out_size])
+    current_outputs = tf.nn.relu(tf.nn.xw_plus_b(reshape_output, hidden_weights, hidden_bias))  # [Batch, ffnn_out_size]
+    return current_outputs
+
+
 def cnn(inputs, filter_sizes, num_filters, name=None):
     num_words = shape(inputs, 0)
     num_chars = shape(inputs, 1)
@@ -481,11 +511,11 @@ def attention_layer(from_tensor,
     return context_layer
 
 
-def biaffine_layer(input1, input2, out_features, bias=(True, True)):
-    in1_features = shape(input1, 2)  # 256
-    in2_features = shape(input2, 2)  # 256
+def biaffine_layer(input1, input2, input_size, out_features, bias=(True, True)):
+    in1_features = input_size
+    in2_features = input_size  # 256
 
-    linear_input_size = in1_features + int(bias[0])
+    # linear_input_size = in1_features + int(bias[0])
     linear_output_size = out_features * (in2_features + int(bias[1]))
 
     batch_size = shape(input1, 0)
@@ -506,20 +536,21 @@ def biaffine_layer(input1, input2, out_features, bias=(True, True)):
         input2 = tf.concat((input2, ones), axis=2)
         dim2 += 1
 
-    # linear: dm1 -> dm2 x out
-    input1 = tf.squeeze(input1, 0)
-    affine = tf.layers.dense(input1, linear_output_size, name="biaffine_dense",
+    input1 = tf.squeeze(input1, 0)  # linear: dm1 -> dm2 x out
+    # print_input1 = tf.Print(input1, [input1])
+    affine = tf.layers.dense(input1,
+                             linear_output_size,
+                             name="biaffine_dense",
                              kernel_initializer=create_initializer(0.02))
 
     # dense_weights = tf.get_variable("dense_weights", [linear_input_size, linear_output_size])
     # dense_bias = tf.get_variable("dense_bias", [linear_output_size])
     # affine = tf.nn.xw_plus_b(input1, dense_weights, dense_bias)
 
-    affine = tf.expand_dims(affine, 0)  # [1,?,514]
+    affine = tf.expand_dims(affine, 0)  # [1,?,514]  Batch, len1, out * dm2
     affine = tf.reshape(affine, [batch_size, len1 * out_features, dim2])  # batch, len1 x out_features, dm2
 
-    # input2 = torch.transpose(input2, 1, 2)  # batch_size, dim2, len2
-    input2 = tf.transpose(input2, [0, 2, 1])
+    input2 = tf.transpose(input2, [0, 2, 1])  # batch_size, dim2, len2
 
     biaffine = tf.transpose(tf.matmul(affine, input2), [0, 2, 1])
 
