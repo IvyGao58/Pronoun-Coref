@@ -6,16 +6,17 @@ import os
 import errno
 import codecs
 import collections
-import json
 import math
 import shutil
 import sys
+import json
 
 import numpy as np
 import tensorflow as tf
 import pyhocon
-from pycorenlp import StanfordCoreNLP
 import six
+from tensorflow.contrib import rnn
+from pycorenlp import StanfordCoreNLP
 
 
 def initialize_from_env():
@@ -331,7 +332,7 @@ def attention_layer(from_tensor,
                     to_tensor,
                     attention_mask=None,
                     num_attention_heads=1,
-                    size_per_head=256,
+                    size_per_head=820,
                     query_act=None,
                     key_act=None,
                     value_act=None,
@@ -543,10 +544,6 @@ def biaffine_layer(input1, input2, input_size, out_features, bias=(True, True)):
                              name="biaffine_dense",
                              kernel_initializer=create_initializer(0.02))
 
-    # dense_weights = tf.get_variable("dense_weights", [linear_input_size, linear_output_size])
-    # dense_bias = tf.get_variable("dense_bias", [linear_output_size])
-    # affine = tf.nn.xw_plus_b(input1, dense_weights, dense_bias)
-
     affine = tf.expand_dims(affine, 0)  # [1,?,514]  Batch, len1, out * dm2
     affine = tf.reshape(affine, [batch_size, len1 * out_features, dim2])  # batch, len1 x out_features, dm2
 
@@ -561,6 +558,80 @@ def biaffine_layer(input1, input2, input_size, out_features, bias=(True, True)):
     # batch, len1, len2, out
 
     return biaffine
+
+
+def gcn_layer(enc_inp, Atilde_fw):
+    """
+    :param enc_inp: input sequence
+    :param Atilde_fw: adjacent matrix of enc_inp
+    :return:
+    """
+    _stack_dimension = 2
+    _vocab_size = 1270
+    _internal_proj_size = 80
+    _embedding_size = 320
+    _memory_dim = 320
+    _hidden_layer1_size = 256
+    _hidden_layer2_size = 256
+    _output_size = 256
+
+    # Dense layer before LSTM
+    Wi = tf.Variable(tf.random_uniform([_vocab_size, _internal_proj_size], 0, 0.1))  # 1270 to 80
+    bi = tf.Variable(tf.random_uniform([_internal_proj_size], -0.1, 0.1))
+    internal_projection = lambda x: tf.nn.relu(tf.matmul(x, Wi) + bi)
+    enc_int = tf.map_fn(internal_projection, enc_inp)
+
+    # Bi-LSTM part
+    enc_cell_fw = rnn.MultiRNNCell([rnn.GRUCell(_memory_dim) for _ in range(_stack_dimension)], state_is_tuple=True)
+
+    with tf.variable_scope('fw'):
+        encoder_fw, _ = tf.nn.dynamic_rnn(enc_cell_fw, enc_int, time_major=True, dtype=tf.float32)
+    encoder_outputs = encoder_fw  # 640
+
+    # Dense layer before GCN
+    Ws = tf.Variable(tf.random_uniform([_memory_dim * 2, _memory_dim], 0, 0.1))
+    bs = tf.Variable(tf.random_uniform([_memory_dim], -0.1, 0.1))
+    first_projection = lambda x: tf.nn.relu(tf.matmul(x, Ws) + bs)
+    hidden = tf.map_fn(first_projection, encoder_outputs)  # 320
+
+    # GCN part
+    X1_fw = GCN_layer_fw(_embedding_size, _hidden_layer1_size, hidden, Atilde_fw)
+    X3_dropout = tf.nn.dropout(X1_fw, dropout)
+
+    # Final feedforward layers
+    Ws = tf.Variable(tf.random_uniform([_hidden_layer2_size * 2, _hidden_layer2_size], 0, 0.1), name='Ws')
+    bs = tf.Variable(tf.random_uniform([_hidden_layer2_size], -0.1, 0.1), name='bs')
+    first_projection = lambda x: tf.nn.relu(tf.matmul(x, Ws) + bs)
+    last_hidden = tf.map_fn(first_projection, X3_dropout)
+    last_hidden_dropout = tf.nn.dropout(last_hidden, dropout)  # 256
+
+    Wf = tf.Variable(tf.random_uniform([_hidden_layer2_size, _output_size], 0, 0.1), name='Wf')
+    bf = tf.Variable(tf.random_uniform([_output_size], -0.1, 0.1), name='bf')
+    final_projection = lambda x: tf.matmul(x, Wf) + bf
+    outputs = tf.map_fn(final_projection, last_hidden_dropout)  # 256
+    return outputs
+
+
+def GCN_layer_fw(embedding_size, hidden_layer1_size, hidden, Atilde_fw):
+    W0_fw = tf.Variable(tf.random_uniform([embedding_size, hidden_layer1_size], 0, 0.1), name='W0_fw')  # [160, 200]
+    b0_fw = tf.Variable(tf.random_uniform([hidden_layer1_size], -0.1, 0.1), name='b0_fw')
+    left_X1_projection_fw = lambda x: tf.matmul(x, W0_fw) + b0_fw
+    left_X1_fw = tf.map_fn(left_X1_projection_fw, hidden)
+    left_X1_fw = tf.transpose(left_X1_fw, perm=[1, 0, 2], name='left_X1_fw')
+    X1_fw = tf.nn.relu(tf.matmul(Atilde_fw, left_X1_fw))
+    X1_fw = tf.transpose(X1_fw, perm=[1, 0, 2])
+    return X1_fw
+
+
+def GCN_layer_bw(embedding_size, hidden_layer1_size, hidden, Atilde_bw):
+    W0_bw = tf.Variable(tf.random_uniform([embedding_size, hidden_layer1_size], 0, 0.1), name='W0_bw')
+    b0_bw = tf.Variable(tf.random_uniform([hidden_layer1_size], -0.1, 0.1), name='b0_bw')
+    left_X1_projection_bw = lambda x: tf.matmul(x, W0_bw) + b0_bw
+    left_X1_bw = tf.map_fn(left_X1_projection_bw, hidden)
+    left_X1_bw = tf.transpose(left_X1_bw, perm=[1, 0, 2], name='left_X1_bw')
+    X1_bw = tf.nn.relu(tf.matmul(Atilde_bw, left_X1_bw))
+    X1_bw = tf.transpose(X1_bw, perm=[1, 0, 2])
+    return X1_bw
 
 
 def create_initializer(initializer_range=0.02):

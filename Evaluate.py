@@ -7,7 +7,7 @@ import os
 
 import tensorflow as tf
 import util
-import BiAffineModel as model
+import p2sModel as model
 import ujson as json
 
 if __name__ == "__main__":
@@ -23,8 +23,11 @@ if __name__ == "__main__":
 
     print('finish processing data')
 
+    mode = 'test'
+    title_path = config["title_map_path"] if mode == 'test' else config["predict_title_map_path"]
+
     title_map = dict()
-    with open(config["title_map_path"], 'r') as file:
+    with open(title_path, 'r') as file:
         lines = file.readlines()
         for line in lines:
             arr = line.split(': ')
@@ -34,7 +37,7 @@ if __name__ == "__main__":
 
     with tf.Session() as session:
         model.restore(session)
-        model.evaluate(session, test_data, official_stdout=True, mode='test', title_map=title_map)
+        model.evaluate(session, test_data, official_stdout=True, mode=mode, title_map=title_map)
         # model.evaluate(session)
         # model.evaluate_baseline_methods(session)
 

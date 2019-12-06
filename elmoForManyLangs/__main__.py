@@ -168,7 +168,7 @@ def test_main():
     cmd.add_argument('--gpu', default=-1, type=int, help='use id of gpu, -1 if cpu.')
     cmd.add_argument('--input_format', default='conll', choices=('plain', 'conll', 'conll_char', 'conll_char_vi'),
                      help='the input format.')
-    cmd.add_argument("--input", default='../data/law/add/conll.dev.txt', help="the path to the raw text file.")
+    cmd.add_argument("--input", default='../data/law/conll.p2s.txt', help="the path to the raw text file.")
     cmd.add_argument("--output_format", default='hdf5', help='the output format. Supported format includes (hdf5, txt).'
                                                              ' Use comma to separate the format identifiers,'
                                                              ' like \'--output_format=hdf5,plain\'')
@@ -263,7 +263,7 @@ def test_main():
             handlers[output_format, output_layer] = \
                 h5py.File(filename, 'w') if output_format == 'hdf5' else open(filename, 'w')
 
-    with h5py.File("elmo_chinese_bag_cache.hdf5", "a") as out_file:
+    with h5py.File("elmo_chinese_cache_p2s.hdf5", "a") as out_file:
         count = 0
         for w, c, lens, masks, texts, title, indice in zip(test_w, test_c, test_lens, test_masks, test_text, test_title,
                                                            test_indices):

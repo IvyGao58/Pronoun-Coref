@@ -30,7 +30,8 @@ class KnowledgePronounCorefModel(object):
         self.eval_data = None  # Load eval data lazily.
         print('Start to load the eval data')
         st = time.time()
-        self.load_eval_data()
+        if not config["predict"]:
+            self.load_eval_data()
         print("Finished in {:.2f}".format(time.time() - st))
 
         input_props = []
@@ -536,6 +537,12 @@ class KnowledgePronounCorefModel(object):
         # print('k: {}'.format(k))
         dummy_scores = tf.zeros([k, 1])  # [k, 1]
 
+        emb_list = [pronoun_embedding, name_embedding, status_embedding]
+        attn_out = self.use_attention(emb_list)  # [1, ?, 256]
+        pronoun_embedding = tf.transpose(attn_out[:, :p_len, :], [1, 0, 2])
+        # candidate_NP_embeddings = attn_out[:, p_len:p_len + m_len, :]
+        # candidate_NP_embeddings = tf.tile(candidate_NP_embeddings, [p_len, 1, 1])
+
         for i in range(self.config["coref_depth"]):
             with tf.variable_scope("coref_layer", reuse=(i > 0)):
                 coreference_scores = self.get_coreference_score(candidate_NP_embeddings, pronoun_embedding,
@@ -543,13 +550,12 @@ class KnowledgePronounCorefModel(object):
                                                                 candidate_NP_offsets, pronoun_offsets,
                                                                 number_features, order_features)  # [k, c]
 
-        # attention
-        emb_list = [pronoun_embedding, name_embedding, status_embedding]
-        attn_out = self.use_attention(emb_list)  # [1, ?, 256]
-        # bi-affine
-        mat_score = self.use_biaffine(attn_out, p_len, m_len)
+        # emb_list = [pronoun_embedding, name_embedding, status_embedding]
+        # attn_out = self.use_attention(emb_list)  # [1, ?, 256]
+        # mat_score = self.use_biaffine(attn_out, p_len, m_len)
+        # bi_score = mat_score + coreference_scores
 
-        bi_score = mat_score + coreference_scores
+        bi_score = coreference_scores
 
         score_after_softmax = tf.nn.softmax(bi_score, 1)  # [k, c]
 
@@ -934,7 +940,7 @@ class KnowledgePronounCorefModel(object):
             all_sentence = list()
 
             doc_id = example['doc_key']
-            if mode == 'test':
+            if mode == 'test' or mode == 'predict':
                 print(title_map[doc_id])
 
             for s in example['sentences']:
@@ -978,7 +984,7 @@ class KnowledgePronounCorefModel(object):
                             msg += 'true' + '\t' + 'pred score: ' + str(tmp_score)
                         else:
                             msg += 'false' + '\t' + 'pred score: ' + str(tmp_score)
-                        if mode == 'test':
+                        if mode == 'test' or mode == 'predict':
                             print(msg)
                 for l in labels[i]:
                     if l:
@@ -986,21 +992,28 @@ class KnowledgePronounCorefModel(object):
             prediction_result.append(prediction_result_by_example)
 
         summary_dict = {}
-        if predict_coreference > 0:
-            p = corrct_predict_coreference / predict_coreference
-            r = corrct_predict_coreference / all_coreference
-            f1 = 2 * p * r / (p + r)
-            summary_dict["Average F1 (py)"] = f1
-            print("Average F1 (py): {:.2f}%".format(f1 * 100))
-            summary_dict["Average precision (py)"] = p
-            print("Average precision (py): {:.2f}%".format(p * 100))
-            summary_dict["Average recall (py)"] = r
-            print("Average recall (py): {:.2f}%".format(r * 100))
-        else:
+        if mode == 'predict':
             summary_dict["Average F1 (py)"] = 0
             summary_dict["Average precision (py)"] = 0
             summary_dict["Average recall (py)"] = 0
             print('there is no positive prediction')
             f1 = 0
+        else:
+            if predict_coreference > 0:
+                p = corrct_predict_coreference / predict_coreference
+                r = corrct_predict_coreference / all_coreference
+                f1 = 2 * p * r / (p + r)
+                summary_dict["Average F1 (py)"] = f1
+                print("Average F1 (py): {:.2f}%".format(f1 * 100))
+                summary_dict["Average precision (py)"] = p
+                print("Average precision (py): {:.2f}%".format(p * 100))
+                summary_dict["Average recall (py)"] = r
+                print("Average recall (py): {:.2f}%".format(r * 100))
+            else:
+                summary_dict["Average F1 (py)"] = 0
+                summary_dict["Average precision (py)"] = 0
+                summary_dict["Average recall (py)"] = 0
+                print('there is no positive prediction')
+                f1 = 0
 
         return util.make_summary(summary_dict), f1

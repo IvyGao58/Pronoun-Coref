@@ -8,7 +8,7 @@ import time
 
 import tensorflow as tf
 
-import BiAffineModel as model
+import p2sModel as model
 import util
 
 if __name__ == "__main__":
@@ -46,9 +46,9 @@ if __name__ == "__main__":
         patience = 0
         while True:
             tf_loss, tf_global_step, _ = session.run([model.loss, model.global_step, model.train_op])
+
             accumulated_loss += tf_loss
 
-            # if tf_global_step >= 250000:
             if patience > config["max_patience"]:
                 print('We have finished our training')
                 break
