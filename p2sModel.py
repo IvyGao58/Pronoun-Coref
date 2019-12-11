@@ -345,7 +345,12 @@ class KnowledgePronounCorefModel(object):
         text_len_mask = tf.sequence_mask(text_len, maxlen=max_sentence_length)
 
         # context to lstm [num_words, emb] [?, 400]
-        context_outputs = self.lstm_contextualize(context_emb, text_len, text_len_mask)
+        context_lstm_outputs = self.lstm_contextualize(context_emb, text_len, text_len_mask)
+
+        context_lstm_outputs = tf.expand_dims(context_lstm_outputs, 0)
+        context_outputs = util.attention_layer(context_lstm_outputs, context_lstm_outputs,
+                                               size_per_head=self.config["contextualization_size"] * 2)
+        context_outputs = tf.squeeze(context_outputs, 0)
 
         # [num_words] [?, 450]
         flattened_head_emb = self.flatten_emb_by_sentence(head_emb, text_len_mask)
@@ -387,7 +392,6 @@ class KnowledgePronounCorefModel(object):
         pronoun_offsets = tf.gather(mention_offsets, pronoun_positions)
 
         k = util.shape(pronoun_positions, 0)
-        # print('k: {}'.format(k))
         dummy_scores = tf.zeros([k, 1])  # [k, 1]
 
         for i in range(self.config["coref_depth"]):
@@ -397,23 +401,30 @@ class KnowledgePronounCorefModel(object):
                                                                 candidate_NP_offsets, pronoun_offsets,
                                                                 number_features, order_features)  # [k, c]
 
-        emb_list = [pronoun_embedding, status_embedding, name_embedding]
-        attn_out = self.use_attention(emb_list)  # [1, ?, 256]
-        mat_score = self.use_biaffine(attn_out, p_len, s_len)  # [k, c]
         score_after_softmax = tf.nn.softmax(coreference_scores, 1)  # [k, c]
-
-        bi_score = mat_score + score_after_softmax
-
-        if self.config['softmax_biaffine_pruning']:
-            threshold = tf.ones([all_k, all_c]) * self.config['softmax_biaffine_threshold']  # [k, c]
+        if self.config['softmax_pruning']:
+            threshold = tf.ones([all_k, all_c]) * self.config['softmax_threshold']  # [k, c]
         else:
             threshold = tf.zeros([all_k, all_c]) - tf.ones([all_k, all_c])
-        ranking_mask = tf.to_float(tf.greater(bi_score, threshold))  # [k, c]
+        ranking_mask = tf.to_float(tf.greater(score_after_softmax, threshold))  # [k, c]
 
-        top_antecedent_scores = tf.concat([dummy_scores, bi_score], 1)  # [k, c + 1]
+        if self.config["apply_biaffine"]:
+            with tf.variable_scope("biaffine_layer"):
+                emb_list = [pronoun_embedding, status_embedding, name_embedding]
+                attn_out = self.use_attention(emb_list)  # [1, ?, 256]
+                biaffine_score = self.use_biaffine(attn_out, p_len, s_len)  # [k, c]
+                coreference_scores = self.config["biaffine_score_weight"] * biaffine_score + \
+                    (1 - self.config["biaffine_score_weight"]) * coreference_scores
 
-        # labels为正，且得分在threshold之上的为True.
-        labels = tf.logical_and(labels, tf.greater(bi_score, threshold))
+                if self.config['softmax_biaffine_pruning']:
+                    biaffine_score = tf.math.sigmoid(biaffine_score)
+                    biaffine_score_softmax = tf.nn.softmax(biaffine_score, 1)
+                    biaffine_threshold = tf.ones([all_k, all_c]) * self.config['softmax_biaffine_threshold']
+                    biaffine_ranking_mask = tf.to_float(tf.greater(biaffine_score_softmax, biaffine_threshold))
+                    ranking_mask = ranking_mask * biaffine_ranking_mask
+
+        top_antecedent_scores = tf.concat([dummy_scores, coreference_scores], 1)  # [k, c + 1]
+        labels = tf.logical_and(labels, tf.greater(score_after_softmax, threshold))
 
         dummy_mask_1 = tf.ones([k, 1])
         dummy_mask_0 = tf.zeros([k, 1])
