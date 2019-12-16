@@ -7,7 +7,9 @@ import os
 
 import tensorflow as tf
 import util
-import p2sModel as model
+import GCNModel as model
+# import p2sModel as model
+# import BiAffineModel as model
 import ujson as json
 
 if __name__ == "__main__":

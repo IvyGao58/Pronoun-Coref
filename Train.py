@@ -8,7 +8,9 @@ import time
 
 import tensorflow as tf
 
-import p2sModel as model
+import GCNModel as model
+# import p2sModel as model
+# import BiAffineModel as model
 import util
 
 if __name__ == "__main__":
@@ -45,7 +47,7 @@ if __name__ == "__main__":
 
         patience = 0
         while True:
-            tf_loss, tf_global_step, _ = session.run([model.loss, model.global_step, model.train_op])
+            tf_loss, tf_global_step, summaries, _ = session.run([model.loss, model.global_step, model.summaries, model.train_op])
 
             accumulated_loss += tf_loss
 
@@ -61,6 +63,7 @@ if __name__ == "__main__":
                 print("[{}] loss={:.2f}, steps/s={:.2f}".format(tf_global_step, average_loss, steps_per_second))
                 writer.add_summary(util.make_summary({"loss": average_loss}), tf_global_step)
                 accumulated_loss = 0.0
+                writer.add_summary(summaries, tf_global_step)
 
             if tf_global_step % eval_frequency == 0:
                 saver.save(session, os.path.join(log_dir, "model"), global_step=tf_global_step)

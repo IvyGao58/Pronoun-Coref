@@ -36,13 +36,15 @@ class KnowledgePronounCorefModel(object):
 
         input_props = []
         input_props.append((tf.string, [None, None]))  # Tokens.
+        input_props.append((tf.float32, [None, None]))  # adj.
+        input_props.append((tf.float32, [None, None]))  # xor.
         input_props.append((tf.float32, [None, None, self.context_embeddings.size]))  # Context embeddings.
         input_props.append((tf.float32, [None, None, self.head_embeddings.size]))  # Head embeddings.
         input_props.append((tf.float32, [None, None, self.lm_size, self.lm_layers]))  # LM embeddings.
-        input_props.append((tf.int32, [None, None, None]))  # Character indices.
         input_props.append((tf.int32, [None]))  # Text lengths.
         input_props.append((tf.int32, []))  # pronoun lengths.
         input_props.append((tf.int32, []))  # name lengths.
+        input_props.append((tf.int32, []))  # status lengths.
         input_props.append((tf.int32, [None]))  # Speaker IDs.
         input_props.append((tf.bool, []))  # Is training.
         input_props.append((tf.int32, [None]))  # gold_starts.
@@ -62,7 +64,7 @@ class KnowledgePronounCorefModel(object):
         self.enqueue_op = queue.enqueue(self.queue_input_tensors)
         self.input_tensors = queue.dequeue()
 
-        self.predictions, self.loss = self.get_predictions_and_loss(*self.input_tensors)
+        self.predictions, self.loss, self.summaries = self.get_predictions_and_loss(*self.input_tensors)
         self.global_step = tf.Variable(0, name="global_step", trainable=False)
         self.reset_global_step = tf.assign(self.global_step, 0)
         learning_rate = tf.train.exponential_decay(self.config["learning_rate"], self.global_step,
@@ -86,10 +88,7 @@ class KnowledgePronounCorefModel(object):
             while True:
                 random.shuffle(train_examples)
                 for example in train_examples:
-                    if self.config["use_multi_span"]:
-                        tensorized_example = self.tensorize_pronoun_example_multi_span(example, is_training=True)
-                    else:
-                        tensorized_example = self.tensorize_pronoun_example(example, is_training=True)
+                    tensorized_example = self.tensorize_pronoun_example(example, is_training=True)
                     feed_dict = dict(zip(self.queue_input_tensors, tensorized_example))
                     session.run(self.enqueue_op, feed_dict=feed_dict)
 
@@ -174,13 +173,13 @@ class KnowledgePronounCorefModel(object):
                 if tmp_np not in gold_mentions and tmp_np[1] - tmp_np[0] < self.config["max_span_width"]:
                     gold_mentions.append(tmp_np)
 
-        status_len = 0
-        for idx, status in enumerate(example['status_name_info']['status']):
-            if status not in gold_mentions and status[1] - status[0] < self.config["max_span_width"]:
-                gold_mentions.append(status)
-                status_len += 1
+        names_len = 0
+        for idx, name in enumerate(example['status_name_info']['status_or_name']):
+            names_len += 1
+            if name not in gold_mentions and name[1] - name[0] < self.config["max_span_width"]:
+                gold_mentions.append(name)
 
-        gold_mentions = sorted(gold_mentions)
+        # gold_mentions = sorted(gold_mentions)
 
         gold_starts, gold_ends = self.tensorize_mentions(gold_mentions)
 
@@ -197,13 +196,11 @@ class KnowledgePronounCorefModel(object):
 
         context_word_emb = np.zeros([len(sentences), max_sentence_length, self.context_embeddings.size])
         head_word_emb = np.zeros([len(sentences), max_sentence_length, self.head_embeddings.size])
-        char_index = np.zeros([len(sentences), max_sentence_length, max_word_length])
         for i, sentence in enumerate(sentences):
             for j, word in enumerate(sentence):
                 tokens[i][j] = word
                 context_word_emb[i, j] = self.context_embeddings[word]
                 head_word_emb[i, j] = self.head_embeddings[word]
-                char_index[i, j, :len(word)] = [self.char_dict[c] for c in word]
         tokens = np.array(tokens)
 
         speaker_dict = {s: i for i, s in enumerate(set(speakers))}
@@ -219,18 +216,25 @@ class KnowledgePronounCorefModel(object):
 
         max_candidate_NP_length = max(num_candidate_NPs)
 
+        # adj matrix  [P, S, M]
+        adj = np.array(example['adj'])
+        length = adj.shape[0]
+        ones = np.ones([length, length])
+        xor = 1 * np.logical_xor(adj, ones)
+
+        assert adj.shape[0] == len(example['pronoun_info']) + max_candidate_NP_length + names_len
+
         candidate_NP_positions = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])
-        name_positions = np.zeros([max_candidate_NP_length, 1])  # [c, 1]
+        name_positions = np.zeros([names_len, 1])  # [c2, 1]
         pronoun_positions = np.zeros([len(example['pronoun_info']), 1])
-        status_positions = np.zeros([status_len, 1])  # [c2, 1]
+        status_positions = np.zeros([max_candidate_NP_length, 1])  # [c, 1]
         labels = np.zeros([len(example['pronoun_info']), max_candidate_NP_length], dtype=bool)
         candidate_mask = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])
 
-        for i, status_example in enumerate(example['status_name_info']['status']):
+        for i, name_example in enumerate(example['status_name_info']['status_or_name']):
             for k, tmp_tuple in enumerate(gold_mentions):
-                if status_example == tmp_tuple:
-                    status_positions[i, 0] = k
-                    break
+                if name_example == tmp_tuple:
+                    name_positions[i, 0] = k
 
         for i, pronoun_example in enumerate(example['pronoun_info']):
             for j, tmp_np in enumerate(pronoun_example['candidate_NPs']):
@@ -238,7 +242,7 @@ class KnowledgePronounCorefModel(object):
                 for k, tmp_tuple in enumerate(gold_mentions):
                     if tmp_tuple == tmp_np:
                         candidate_NP_positions[i, j] = k
-                        name_positions[j, 0] = k
+                        status_positions[j, 0] = k
                         break
 
                 if tmp_np in pronoun_example['correct_NPs']:
@@ -250,138 +254,17 @@ class KnowledgePronounCorefModel(object):
                     break
 
         p_len = pronoun_positions.shape[0]
-        n_len = max_candidate_NP_length
+        n_len = names_len  # number of names
+        s_len = max_candidate_NP_length
 
         number_features = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])
-        # for i, pronoun_example in enumerate(example['pronoun_info']):
-        #     for j, tmp_np in enumerate(pronoun_example['candidate_NPs']):
-        #         tmp_encoded_name = str(tmp_np[0]) + '$' + str(tmp_np[1])
-        #         if tmp_encoded_name in pronoun_example['features']:
-        #             number_features[i, j] = pronoun_example['features'][tmp_encoded_name]['number']
-
         order_features = np.zeros([len(example['pronoun_info']), 1])  # [k, 1]
         for idx, pronoun_example in enumerate(example['pronoun_info']):
             order_features[idx, 0] = pronoun_example['pronoun_features']['order']
 
-        example_tensors = (tokens, context_word_emb, head_word_emb, lm_emb, char_index, text_len, p_len, n_len,
-                           speaker_ids, is_training, gold_starts, gold_ends, number_features, candidate_NP_positions,
+        example_tensors = (tokens, adj, xor, context_word_emb, head_word_emb, lm_emb, text_len, p_len, n_len,
+                           s_len, speaker_ids, is_training, gold_starts, gold_ends, number_features, candidate_NP_positions,
                            pronoun_positions, name_positions, status_positions, order_features, labels, candidate_mask)
-
-        return example_tensors
-
-    def tensorize_pronoun_example_multi_span(self, example, is_training):
-        """
-        notice: input_props.append((tf.int32, [None, None]))  # gold_starts or gold_ends
-        :param example: input example
-        :param is_training:
-        :return: tensorized example
-        """
-        gold_mentions = list()
-
-        # gold_mentions
-        for idx, pronoun_example in enumerate(example['pronoun_info']):
-            gold_mentions.append(pronoun_example['current_pronoun'])
-
-        current_candidate_nps = example['pronoun_info'][0]['candidate_NPs']
-        max_candidate_NP_length = len(current_candidate_nps)  # c
-        num_chain_NPs = list()
-
-        for np_list in current_candidate_nps:
-            num_chain_NPs.append(len(np_list))
-            if not self.is_in_gold_mention(np_list, gold_mentions):
-                gold_mentions.append(np_list)
-
-        status_len = 0
-        for idx, status_example in enumerate(example['status_name_info']['status']):
-            if not self.is_in_gold_mention(status_example, gold_mentions):
-                gold_mentions.append(status_example)
-                status_len += 1
-
-        # gold_mentions = sorted(gold_mentions)
-        gold_starts, gold_ends = self.tensorize_mention_list(gold_mentions)
-
-        sentences = example["sentences"]
-        num_words = sum(len(s) for s in sentences)
-        speakers = util.flatten(example["speakers"])
-
-        assert num_words == len(speakers)
-        max_sentence_length = max(len(s) for s in sentences)
-        max_word_length = max(max(max(len(w) for w in s) for s in sentences), max(self.config["filter_widths"]))
-        text_len = np.array([len(s) for s in sentences])
-        tokens = [[""] * max_sentence_length for _ in sentences]
-
-        # context_word_emb, head_word_emb, char_index
-        context_word_emb = np.zeros([len(sentences), max_sentence_length, self.context_embeddings.size])
-        head_word_emb = np.zeros([len(sentences), max_sentence_length, self.head_embeddings.size])
-        char_index = np.zeros([len(sentences), max_sentence_length, max_word_length])
-        for i, sentence in enumerate(sentences):
-            for j, word in enumerate(sentence):
-                tokens[i][j] = word
-                context_word_emb[i, j] = self.context_embeddings[word]
-                head_word_emb[i, j] = self.head_embeddings[word]
-                char_index[i, j, :len(word)] = [self.char_dict[c] for c in word]
-        tokens = np.array(tokens)
-
-        # speaker
-        speaker_dict = {s: i for i, s in enumerate(set(speakers))}
-        speaker_ids = np.array([speaker_dict[s] for s in speakers])
-
-        doc_key = example["doc_key"].strip()
-
-        lm_emb = self.load_lm_embeddings(doc_key)
-
-        candidate_NP_positions = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])  # [k, c]
-
-        name_positions = np.zeros([max_candidate_NP_length, 1])  # [c, 1]
-        pronoun_positions = np.zeros([len(example['pronoun_info']), 1])
-        status_positions = np.zeros([status_len, 1])  # [c2, 1]
-        labels = np.zeros([len(example['pronoun_info']), max_candidate_NP_length], dtype=bool)  # [k ,c]
-        candidate_mask = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])
-
-        for i, status_example in enumerate(example['status_name_info']['status']):
-            for k, tmp_tuple in enumerate(gold_mentions):
-                if status_example == tmp_tuple:
-                    status_positions[i, 0] = k
-                    break
-
-        # assign candidate_NP_positions
-        for i, pronoun_example in enumerate(example['pronoun_info']):
-            for j, tmp_np in enumerate(pronoun_example['candidate_NPs']):
-                candidate_mask[i, j] = 1
-                for k, tmp_tuple in enumerate(gold_mentions):
-                    if tmp_tuple == tmp_np:
-                        candidate_NP_positions[i, j] = k
-                        name_positions[j, 0] = k
-                        break
-
-                if j in pronoun_example['correct_NPs']:
-                    labels[i, j] = 1
-
-            for m, tmp_tuple in enumerate(gold_mentions):
-                if tmp_tuple == pronoun_example['current_pronoun']:
-                    pronoun_positions[i, 0] = m
-                    break
-
-        p_len = pronoun_positions.shape[0]
-        n_len = max_candidate_NP_length
-
-        # features
-        number_features = np.zeros([len(example['pronoun_info']), max_candidate_NP_length])  # [k, c]
-        # for i, pronoun_example in enumerate(example['pronoun_info']):
-        #     for j, tmp_np in enumerate(pronoun_example['candidate_NPs']):
-        #         tmp_encoded_name = str(tmp_np[0]) + '$' + str(tmp_np[1])
-        #         if tmp_encoded_name in pronoun_example['features']:
-        #             number_features[i, j] = pronoun_example['features'][tmp_encoded_name]['number']
-
-        # order features
-        order_features = np.zeros([len(example['pronoun_info']), 1])  # [k, 1]
-        for idx, pronoun_example in enumerate(example['pronoun_info']):
-            order_features[idx, 0] = pronoun_example['pronoun_features']['order']
-
-        example_tensors = (tokens, context_word_emb, head_word_emb, lm_emb, char_index, text_len, p_len, n_len,
-                           speaker_ids, is_training, gold_starts, gold_ends, number_features, candidate_NP_positions,
-                           pronoun_positions, name_positions, status_positions, order_features,
-                           labels, candidate_mask)
 
         return example_tensors
 
@@ -417,8 +300,8 @@ class KnowledgePronounCorefModel(object):
     def get_dropout(self, dropout_rate, is_training):
         return 1 - (tf.to_float(is_training) * dropout_rate)
 
-    def get_predictions_and_loss(self, tokens, context_word_emb, head_word_emb, lm_emb, char_index, text_len, p_len,
-                                 m_len, speaker_ids, is_training, gold_starts, gold_ends, number_features,
+    def get_predictions_and_loss(self, tokens, adj, xor, context_word_emb, head_word_emb, lm_emb, text_len, p_len,
+                                 m_len, s_len, speaker_ids, is_training, gold_starts, gold_ends, number_features,
                                  candidate_positions, pronoun_positions, name_positions, status_positions,
                                  order_features, labels, candidate_mask):
         all_k = util.shape(number_features, 0)
@@ -434,27 +317,6 @@ class KnowledgePronounCorefModel(object):
 
         context_emb_list = [context_word_emb]
         head_emb_list = [head_word_emb]
-
-        # character emb
-        if self.config["char_embedding_size"] > 0:
-            # [num_sentences, max_sentence_length, max_word_length, emb]  [?, ?, ?, 8]
-            value = tf.get_variable("char_embeddings", [len(self.char_dict), self.config["char_embedding_size"]])
-            char_emb = tf.gather(value, char_index)
-
-            # [num_sentences * max_sentence_length, max_word_length, emb] [?, ?, 8]
-            flattened_char_emb = tf.reshape(char_emb, [num_sentences * max_sentence_length, util.shape(char_emb, 2),
-                                                       util.shape(char_emb, 3)])
-
-            # [num_sentences * max_sentence_length, emb] [?, 150]
-            flattened_aggregated_char_emb = util.cnn(flattened_char_emb, self.config["filter_widths"], self.config[
-                "filter_size"])
-
-            # [num_sentences, max_sentence_length, emb] [?, ?, 150]
-            aggregated_char_emb = tf.reshape(flattened_aggregated_char_emb, [num_sentences, max_sentence_length,
-                                                                             util.shape(flattened_aggregated_char_emb,
-                                                                                        1)])
-            context_emb_list.append(aggregated_char_emb)
-            head_emb_list.append(aggregated_char_emb)
 
         lm_emb_size = util.shape(lm_emb, 2)  # 1024
         lm_num_layers = util.shape(lm_emb, 3)  # 3
@@ -543,24 +405,48 @@ class KnowledgePronounCorefModel(object):
                                                                 top_span_speaker_ids, pronoun_speaker_id,
                                                                 candidate_NP_offsets, pronoun_offsets,
                                                                 number_features, order_features)  # [k, c]
-
-        emb_list = [pronoun_embedding, name_embedding, status_embedding]
-        attn_out = self.use_attention(emb_list)  # [1, ?, 256]
-        mat_score = self.use_biaffine(attn_out, p_len, m_len)  # [k, c]
-        mat_score = tf.nn.softmax(mat_score, 1)
+        tf.summary.histogram("coreference_scores", coreference_scores)
         score_after_softmax = tf.nn.softmax(coreference_scores, 1)  # [k, c]
-        bi_score = self.config["biaffine_score_weight"] * mat_score + (1 - self.config["biaffine_score_weight"]) * score_after_softmax
-
-        if self.config['softmax_biaffine_pruning']:
-            threshold = tf.ones([all_k, all_c]) * self.config['softmax_biaffine_threshold']  # [k, c]
+        if self.config['softmax_pruning']:
+            threshold = tf.ones([all_k, all_c]) * self.config['softmax_threshold']  # [k, c]
         else:
             threshold = tf.zeros([all_k, all_c]) - tf.ones([all_k, all_c])
-        ranking_mask = tf.to_float(tf.greater(bi_score, threshold))  # [k, c]
+        ranking_mask = tf.to_float(tf.greater(score_after_softmax, threshold))  # [k, c]
 
-        top_antecedent_scores = tf.concat([dummy_scores, bi_score], 1)  # [k, c + 1]
+        if self.config["apply_biaffine"]:
+            with tf.variable_scope("biaffine_layer"):
+                emb_list = [pronoun_embedding, status_embedding, name_embedding]
+                if self.config["use_PMS_attention"]:
+                    attn_out = self.use_attention(emb_list)  # [1, ?, 256]
+                    biaffine_score = self.use_attn_biaffine(attn_out, s_len, p_len)
 
-        # labels为正，且得分在threshold之上的为True.
-        labels = tf.logical_and(labels, tf.greater(bi_score, threshold))
+                elif self.config["use_PMS_gcn"]:
+                    gcn_out = self.use_gcn(emb_list, adj)  # [1, ?, 128]
+                    biaffine_score = self.use_gcn_biaffine(gcn_out, status_embedding, pronoun_embedding, s_len, p_len)
+                    tf.summary.histogram("bi_score(no-softmax)", biaffine_score)
+                else:
+                    biaffine_score = tf.zeros([p_len, s_len], dtype=tf.float32)
+
+                coreference_scores = self.config["biaffine_score_weight"] * biaffine_score + \
+                    (1 - self.config["biaffine_score_weight"]) * coreference_scores
+
+                if self.config["use_xor_matrix"]:
+                    xor_mat = tf.slice(xor, begin=[0, p_len], size=[p_len, s_len])  # [p, s]
+                    coreference_scores = tf.multiply(coreference_scores, xor_mat)
+
+                if self.config['softmax_biaffine_pruning']:
+                    biaffine_score = tf.math.sigmoid(biaffine_score)
+                    tf.summary.histogram("bi_score(sigmoid)", biaffine_score)
+
+                    biaffine_score_softmax = tf.nn.softmax(biaffine_score, 1)
+                    tf.summary.histogram("bi_score(softmax)", biaffine_score_softmax)
+
+                    biaffine_threshold = tf.ones([all_k, all_c]) * self.config['softmax_biaffine_threshold']
+                    biaffine_ranking_mask = tf.to_float(tf.greater(biaffine_score_softmax, biaffine_threshold))
+                    ranking_mask = ranking_mask * biaffine_ranking_mask
+
+        top_antecedent_scores = tf.concat([dummy_scores, coreference_scores], 1)  # [k, c + 1]
+        labels = tf.logical_and(labels, tf.greater(score_after_softmax, threshold))
 
         dummy_mask_1 = tf.ones([k, 1])
         dummy_mask_0 = tf.zeros([k, 1])
@@ -570,6 +456,7 @@ class KnowledgePronounCorefModel(object):
 
         if self.config['random_sample_training']:
             random_mask = tf.greater(tf.random_uniform([all_k, all_c]), tf.ones([all_k, all_c]) * 0.3)
+            labels = tf.logical_and(labels, random_mask)
             ranking_mask = ranking_mask * tf.to_float(random_mask)
 
         dummy_labels = tf.logical_not(tf.reduce_any(labels, 1, keepdims=True))  # [k, 1]
@@ -581,35 +468,77 @@ class KnowledgePronounCorefModel(object):
                                  top_antecedent_labels)
         loss = tf.reduce_sum(loss)  # []
 
+        summaries = tf.summary.merge_all()
+
         return [top_antecedent_scores * mask_for_prediction * ranking_mask_for_prediction,
-                score_after_softmax * candidate_mask], loss
+                score_after_softmax * candidate_mask], loss, summaries
+
+    def use_gcn(self, emb_list, adj_mat):
+        pronoun_embedding, status_embedding, name_embedding = emb_list
+        pronoun_embedding = tf.squeeze(pronoun_embedding, 1)  # [P, emb]
+        status_embedding = tf.squeeze(status_embedding, 1)  # [S, emb]
+        name_embedding = tf.squeeze(name_embedding, 1)  # [M, emb]
+        flattened_emb = tf.concat([pronoun_embedding, status_embedding, name_embedding], 0)  # [P+S+M, emb]
+        flattened_emb = tf.expand_dims(flattened_emb, 0)  # [1, P+S+M, emb]
+
+        # [1, ?, 128]
+        attn_out = util.attention_layer(flattened_emb, flattened_emb, size_per_head=self.config["size_per_head_with_gcn"])
+        add_out = tf.add(flattened_emb, attn_out)
+
+        gcn_out = util.gcn_layer(add_out, adj_mat)
+        return gcn_out
+
+    def use_gcn_biaffine(self, gcn_out, status_embedding, pronoun_embedding, s_len, p_len):
+        gcned_pronoun_emb = gcn_out[:, :p_len, :]  # [1, p, 128]
+        gcned_status_emb = gcn_out[:, p_len:p_len+s_len, :]  # [1, s, 128]
+
+        pronoun_embedding = tf.transpose(pronoun_embedding, [1, 0, 2])  # [1, p, 820]
+        status_embedding = tf.transpose(status_embedding, [1, 0, 2])
+
+        pronoun_embedding = tf.concat([pronoun_embedding, gcned_pronoun_emb], 2)  # [[1, s, 948]
+        status_embedding = tf.concat([status_embedding, gcned_status_emb], 2)
+
+        mat = tf.concat([pronoun_embedding, status_embedding], 1)
+
+        biaffine = util.biaffine_layer(mat, mat, 948, self.config["biaffine_out_features"])  # [1, k+s, k+s, 2]
+        biaffine = tf.squeeze(biaffine, 0)
+
+        biaffine_pos = tf.slice(biaffine, begin=[0, 0, 1], size=[-1, -1, 1])  # [k+c, k+c, 1]
+        biaffine = tf.squeeze(biaffine_pos, 2)
+
+        s_p_mat = tf.slice(biaffine, begin=[0, p_len], size=[p_len, s_len])  # [k, s]
+        p_s_mat = tf.slice(biaffine, begin=[p_len, 0], size=[s_len, p_len])  # [s, k]
+
+        mat_score = s_p_mat + tf.transpose(p_s_mat, [1, 0])
+        return mat_score
 
     def use_attention(self, emb_list):
         # flattened_pronoun_emb, flattened_name_emb = self.emb2cnn(emb_list)
-        pronoun_embedding, name_embedding, status_embedding = emb_list
+        pronoun_embedding, status_embedding, name_embedding = emb_list
         pronoun_embedding = tf.squeeze(pronoun_embedding, 1)  # [k1, emb]
-        name_embedding = tf.squeeze(name_embedding, 1)  # [k2, emb]
         status_embedding = tf.squeeze(status_embedding, 1)  # [k3, emb]
+        name_embedding = tf.squeeze(name_embedding, 1)  # [k2, emb]
 
-        flattened_emb = tf.concat([pronoun_embedding, name_embedding, status_embedding], 0)  # [k1+k2+k3, emb]
+        flattened_emb = tf.concat([pronoun_embedding, status_embedding, name_embedding], 0)  # [k1+k2+k3, emb]
         flattened_emb = tf.expand_dims(flattened_emb, 0)  # [1, k1+k2, emb]
 
-        attn_out = util.attention_layer(flattened_emb, flattened_emb, size_per_head=self.config["size_per_head"])  # [1, ?, 256]
+        # [1, ?, 256]
+        attn_out = util.attention_layer(flattened_emb, flattened_emb, size_per_head=self.config["size_per_head"])
         return attn_out
 
-    def use_biaffine(self, attn_out, p_len, m_len):
-        p_m_out = attn_out[:, :p_len+m_len, :]
-        biaffine = util.biaffine_layer(p_m_out, p_m_out, self.config["size_per_head"],
+    def use_attn_biaffine(self, attn_out, s_len, p_len):
+        p_s_out = attn_out[:, :p_len+s_len, :]
+        biaffine = util.biaffine_layer(p_s_out, p_s_out, self.config["size_per_head"],
                                        self.config["biaffine_out_features"])  # [1, k+c, k+c]
         biaffine = tf.squeeze(biaffine, 0)  # [k+c, k+c]
 
         biaffine_pos = tf.slice(biaffine, begin=[0, 0, 1], size=[-1, -1, 1])  # [k+c, k+c, 1]
         biaffine_pos = tf.squeeze(biaffine_pos, 2)  # [k+c, k+c]
 
-        p_m_mat = tf.slice(biaffine_pos, begin=[0, p_len], size=[p_len, m_len])  # [k, c]
-        m_p_mat = tf.slice(biaffine_pos, begin=[p_len, 0], size=[m_len, p_len])  # [c, k]
+        p_s_mat = tf.slice(biaffine_pos, begin=[0, p_len], size=[p_len, s_len])  # [k, c]
+        s_p_mat = tf.slice(biaffine_pos, begin=[p_len, 0], size=[s_len, p_len])  # [c, k]
 
-        mat_score = p_m_mat + tf.transpose(m_p_mat, [1, 0])
+        mat_score = p_s_mat + tf.transpose(s_p_mat, [1, 0])
         return mat_score
 
     def emb2cnn(self, emb_list):
@@ -881,7 +810,7 @@ class KnowledgePronounCorefModel(object):
                 if layer > 0:
                     # [num_sentences, max_sentence_length, emb]
                     highway_gates = tf.sigmoid(util.projection(text_outputs, util.shape(text_outputs, 2)))
-                    text_outputs = highway_gates * text_outputs + (1 - highway_gates) * current_inputs
+                    text_outputs = highway_gates * text_outputs +(1 - highway_gates) * current_inputs
                 current_inputs = text_outputs
 
         return self.flatten_emb_by_sentence(text_outputs, text_len_mask)
@@ -911,10 +840,7 @@ class KnowledgePronounCorefModel(object):
         if evaluation_data:
             separate_data = list()
             for tmp_example in evaluation_data:
-                if self.config["use_multi_span"]:
-                    tensorized_example = self.tensorize_pronoun_example_multi_span(tmp_example, is_training=True)
-                else:
-                    tensorized_example = self.tensorize_pronoun_example(tmp_example, is_training=True)
+                tensorized_example = self.tensorize_pronoun_example(tmp_example, is_training=True)
                 separate_data.append((tensorized_example, tmp_example))
         else:
             separate_data = self.eval_data
@@ -935,7 +861,7 @@ class KnowledgePronounCorefModel(object):
             for s in example['sentences']:
                 all_sentence += s
 
-            _, _, _, _, _, _, _, _, _, _, gold_starts, gold_ends, number_features,  candidate_NP_positions, \
+            _, _, _, _, _, _, _, _, _, _, _, _, gold_starts, gold_ends, number_features,  candidate_NP_positions, \
             pronoun_positions, name_positions, status_positions, order_features, labels, _ = tensorized_example
 
             feed_dict = {i: t for i, t in zip(self.input_tensors, tensorized_example)}
@@ -965,16 +891,16 @@ class KnowledgePronounCorefModel(object):
                     candidate_positions_end = int(gold_ends[current_candidate_index]) + 1
                     current_candidate = ''.join(all_sentence[candidate_positions_start:candidate_positions_end])
                     if tmp_score > 0:
-                        print(tmp_score)
-                        msg = current_pronoun + '\t' + 'link to: ' + current_candidate + '\t'
+                        msg = '{} link to: {} ({},{}) \t'.format(current_pronoun, current_candidate,
+                                                                 candidate_positions_start, candidate_positions_end)
                         predict_coreference += 1
                         if labels[i][j]:
                             corrct_predict_coreference += 1
-                            msg += 'true' + '\t' + 'pred score: ' + str(tmp_score)
+                            msg += 'True-predict' + '\t' + 'score: ' + str(tmp_score)
                         else:
-                            msg += 'false' + '\t' + 'pred score: ' + str(tmp_score)
-                        if mode == 'test' or mode == 'predict':
-                            print(msg)
+                            msg += 'False-predict' + '\t' + 'score: ' + str(tmp_score)
+                        # if mode == 'test' or mode == 'predict':
+                        print(msg)
                 for l in labels[i]:
                     if l:
                         all_coreference += 1
