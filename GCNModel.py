@@ -174,7 +174,7 @@ class KnowledgePronounCorefModel(object):
                     gold_mentions.append(tmp_np)
 
         names_len = 0
-        for idx, name in enumerate(example['status_name_info']['status_or_name']):
+        for _, name in enumerate(example['status_name_info']['status_or_name']):
             names_len += 1
             if name not in gold_mentions and name[1] - name[0] < self.config["max_span_width"]:
                 gold_mentions.append(name)
@@ -220,6 +220,8 @@ class KnowledgePronounCorefModel(object):
         adj = np.array(example['adj'])
         length = adj.shape[0]
         ones = np.ones([length, length])
+
+        # xor matrix
         xor = 1 * np.logical_xor(adj, ones)
 
         assert adj.shape[0] == len(example['pronoun_info']) + max_candidate_NP_length + names_len
@@ -406,7 +408,10 @@ class KnowledgePronounCorefModel(object):
                                                                 candidate_NP_offsets, pronoun_offsets,
                                                                 number_features, order_features)  # [k, c]
         tf.summary.histogram("coreference_scores", coreference_scores)
+
         score_after_softmax = tf.nn.softmax(coreference_scores, 1)  # [k, c]
+        tf.summary.histogram("coreference_scores_softmax", score_after_softmax)
+
         if self.config['softmax_pruning']:
             threshold = tf.ones([all_k, all_c]) * self.config['softmax_threshold']  # [k, c]
         else:
@@ -423,12 +428,14 @@ class KnowledgePronounCorefModel(object):
                 elif self.config["use_PMS_gcn"]:
                     gcn_out = self.use_gcn(emb_list, adj)  # [1, ?, 128]
                     biaffine_score = self.use_gcn_biaffine(gcn_out, status_embedding, pronoun_embedding, s_len, p_len)
-                    tf.summary.histogram("bi_score(no-softmax)", biaffine_score)
+                    tf.summary.histogram("bi_affine_score", biaffine_score)
                 else:
                     biaffine_score = tf.zeros([p_len, s_len], dtype=tf.float32)
 
                 coreference_scores = self.config["biaffine_score_weight"] * biaffine_score + \
                     (1 - self.config["biaffine_score_weight"]) * coreference_scores
+
+                # coreference_scores += biaffine_score
 
                 if self.config["use_xor_matrix"]:
                     xor_mat = tf.slice(xor, begin=[0, p_len], size=[p_len, s_len])  # [p, s]
@@ -436,10 +443,10 @@ class KnowledgePronounCorefModel(object):
 
                 if self.config['softmax_biaffine_pruning']:
                     biaffine_score = tf.math.sigmoid(biaffine_score)
-                    tf.summary.histogram("bi_score(sigmoid)", biaffine_score)
+                    tf.summary.histogram("bi_affine_score_relu", biaffine_score)
 
                     biaffine_score_softmax = tf.nn.softmax(biaffine_score, 1)
-                    tf.summary.histogram("bi_score(softmax)", biaffine_score_softmax)
+                    tf.summary.histogram("bi_affine_score_softmax", biaffine_score_softmax)
 
                     biaffine_threshold = tf.ones([all_k, all_c]) * self.config['softmax_biaffine_threshold']
                     biaffine_ranking_mask = tf.to_float(tf.greater(biaffine_score_softmax, biaffine_threshold))
@@ -482,10 +489,11 @@ class KnowledgePronounCorefModel(object):
         flattened_emb = tf.expand_dims(flattened_emb, 0)  # [1, P+S+M, emb]
 
         # [1, ?, 128]
-        attn_out = util.attention_layer(flattened_emb, flattened_emb, size_per_head=self.config["size_per_head_with_gcn"])
-        add_out = tf.add(flattened_emb, attn_out)
+        # attn_out = util.attention_layer(flattened_emb, flattened_emb,
+        # size_per_head=self.config["size_per_head_with_gcn"])
+        # add_out = tf.add(flattened_emb, attn_out)
 
-        gcn_out = util.gcn_layer(add_out, adj_mat)
+        gcn_out = util.gcn_layer(flattened_emb, adj_mat)
         return gcn_out
 
     def use_gcn_biaffine(self, gcn_out, status_embedding, pronoun_embedding, s_len, p_len):
@@ -506,11 +514,10 @@ class KnowledgePronounCorefModel(object):
         biaffine_pos = tf.slice(biaffine, begin=[0, 0, 1], size=[-1, -1, 1])  # [k+c, k+c, 1]
         biaffine = tf.squeeze(biaffine_pos, 2)
 
-        s_p_mat = tf.slice(biaffine, begin=[0, p_len], size=[p_len, s_len])  # [k, s]
-        p_s_mat = tf.slice(biaffine, begin=[p_len, 0], size=[s_len, p_len])  # [s, k]
-
-        mat_score = s_p_mat + tf.transpose(p_s_mat, [1, 0])
-        return mat_score
+        p_s_mat = tf.slice(biaffine, begin=[0, p_len], size=[p_len, s_len])  # [k, s]
+        # s_p_mat = tf.slice(biaffine, begin=[p_len, 0], size=[s_len, p_len])  # [s, k]
+        # mat_score = s_p_mat + tf.transpose(p_s_mat, [1, 0])
+        return p_s_mat
 
     def use_attention(self, emb_list):
         # flattened_pronoun_emb, flattened_name_emb = self.emb2cnn(emb_list)
@@ -756,6 +763,7 @@ class KnowledgePronounCorefModel(object):
         feature_emb = tf.nn.dropout(feature_emb, self.dropout)  # [k, c, emb]
 
         target_emb = tf.tile(pronoun_emb, [1, c, 1])  # [k, c, emb]
+
         similarity_emb = candidate_NPs_emb * target_emb  # [k, c, emb]
 
         # candidate_emb + pronoun_emb * candidate_emb + pronoun_emb

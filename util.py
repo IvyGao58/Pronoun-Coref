@@ -535,18 +535,12 @@ def biaffine_layer(input1, input2, input_size, out_features, bias=(True, True)):
         input2 = tf.concat((input2, ones), axis=2)
         dim2 += 1
 
-    input1 = tf.squeeze(input1, 0)  # linear: dm1 -> dm2 x out
+    input1 = tf.squeeze(input1, 0)  # dm1 -> dm2 x out
 
-    affine_ws = tf.Variable(tf.random_uniform([dim1, linear_output_size], 0, 0.1))
+    affine_ws = tf.get_variable("biaffine_weights", [dim1, linear_output_size])
     affine = tf.nn.relu(tf.matmul(input1, affine_ws))  # 514
 
-    # affine = tf.layers.dense(input1,
-    #                          linear_output_size,
-    #                          use_bias=False,
-    #                          name="biaffine_dense",
-    #                          kernel_initializer=create_initializer(0.02))
-
-    affine = tf.expand_dims(affine, 0)  # [1,?,514]  Batch, len1, out * dm2
+    affine = tf.expand_dims(affine, 0)  #  Batch, len1, out * dm2
     affine = tf.reshape(affine, [batch_size, len1 * out_features, dim2])  # batch, len1 x out_features, dm2
 
     input2 = tf.transpose(input2, [0, 2, 1])  # batch_size, dim2, len2

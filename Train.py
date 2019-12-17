@@ -7,6 +7,7 @@ import os
 import time
 
 import tensorflow as tf
+from tensorflow.python import debug as tf_debug
 
 import GCNModel as model
 # import p2sModel as model
@@ -31,6 +32,7 @@ if __name__ == "__main__":
     default_config.gpu_options.allow_growth = True
 
     with tf.Session(config=default_config) as session:
+        # session = tf_debug.LocalCLIDebugWrapperSession(session, ui_type="readline")
         writer = tf.summary.FileWriter(log_dir, session.graph, flush_secs=20)
         print('begin to initialize global variables...')
         session.run(tf.global_variables_initializer())
